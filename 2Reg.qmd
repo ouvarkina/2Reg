@@ -1,0 +1,196 @@
+---
+title: "2Reg"
+format: html
+editor: visual
+---
+
+```{r}
+
+suppressPackageStartupMessages({
+  library(readxl); library(dplyr); library(purrr); library(stringr)
+  library(tibble); library(openxlsx)
+})
+
+report_file  <- "Отчет_все_записи_12.01.2026-2.xlsx"
+dict_file    <- "2Reg_Dictionary_tidy.xlsx"
+patients_out <- "2Reg_patients_raw.xlsx"   # tidy: 1 пациент × timepoint
+ha_out       <- "2Reg_HA_raw.xlsx"         # long: 1 процедура × строка
+
+norm_txt <- function(x){
+  x <- as.character(x)
+  x <- str_replace_all(x, "\u00A0", " ")
+  x <- str_replace_all(x, "[\u2212\u2013\u2014]", "-")
+  x <- str_squish(x); x[x==""] <- NA_character_; x
+}
+
+tp_code <- function(s){
+  s <- norm_txt(s); if (is.na(s)) return(NA_character_)
+  u <- if (str_detect(str_to_lower(s), "сут|дн")) "d" else "h"
+  m <- str_match(s, "Точка\\s*\\[\\s*([-+]?\\d+)\\s*;\\s*([-+]?\\d+)\\s*\\]")
+  if (is.na(m[1,1])) return(NA_character_)
+  f <- function(z) if (z < 0) paste0("m", abs(z), u) else paste0(z, u)
+  paste0(f(as.integer(m[1,2])), "_", f(as.integer(m[1,3])))
+}
+
+# ---- dictionary (tidy) ----
+dict <- read_excel(dict_file) %>%
+  transmute(short = as.character(short), ru = as.character(ru), kind = as.character(kind)) %>%
+  mutate(across(c(short, ru, kind), norm_txt))
+
+ds <- dict %>% filter(kind == "static")
+dt <- dict %>% filter(kind == "time")
+
+# ---- sheet -> map(key->value) ----
+extract_one_sheet <- function(f, sh){
+  x <- read_excel(f, sheet = sh, col_names = FALSE, na = c("", "Нет данных", "Нет данных ")) %>%
+    mutate(across(everything(), ~ if_else(is.na(.x), NA_character_, as.character(.x))))
+  nr <- nrow(x); nc <- ncol(x)
+  cell <- function(i,j) if (i<1||i>nr||j<1||j>nc) NA_character_ else x[[j]][i]
+  empty_row <- function(i) all(is.na(map_chr(seq_len(nc), ~ norm_txt(cell(i,.x)))))
+  sect <- function(i){ c1 <- norm_txt(cell(i,1)); !is.na(c1) && all(is.na(map_chr(2:nc, ~ norm_txt(cell(i,.x))))) }
+
+  out <- list()
+  add <- function(k,v){
+    k <- norm_txt(k); v <- norm_txt(v)
+    if (is.na(k) || is.na(v)) return()
+    if (!is.null(out[[k]]) && !is.na(out[[k]])) {
+      if (!str_detect(out[[k]], fixed(v))) out[[k]] <<- paste(out[[k]], v, sep=" | ")
+    } else out[[k]] <<- v
+  }
+
+  for (i in seq_len(nr)) {
+    k <- norm_txt(cell(i,1)); if (is.na(k) || k=="Параметр") next
+    v <- map_chr(2:nc, ~ norm_txt(cell(i,.x))); v <- v[!is.na(v)]
+    if (length(v)) add(k, paste(v, collapse=" | "))
+  }
+
+  pr <- which(norm_txt(x[[1]])=="Параметр")
+  for (st in pr){
+    hdr <- map_chr(2:nc, ~ norm_txt(cell(st,.x)))
+    cols <- which(!is.na(hdr)) + 1; hs <- hdr[!is.na(hdr)]
+    tt <- any(str_detect(hs, regex("\\bТочка\\b", TRUE)))
+
+    title <- NA_character_
+    if (st>1) for (t in seq(st-1,1,-1)) if (sect(t)) { title <- norm_txt(cell(t,1)); break }
+
+    pref <- NA_character_
+    if (!is.na(title)) {
+      if (str_detect(str_to_upper(title), "КЛЕТКИ")) pref <- "Клетки крови"
+      if (str_detect(str_to_upper(title), "БИОХИМИЯ")) pref <- "Биохимия"
+    }
+
+    i <- st+1
+    while (i<=nr){
+      rn <- norm_txt(cell(i,1))
+      if (is.na(rn)) { if (empty_row(i)) break; i <- i+1; next }
+      if (rn=="Параметр") break
+
+      rn2 <- rn
+      if (tt && rn=="Дата проведения" && !is.na(title) && str_detect(str_to_upper(title), "КЛИНИЧЕСКАЯ ОЦЕНКА"))
+        rn2 <- "Дата клинической оценки"
+      if (tt && rn=="Дата пробы" && !is.na(pref)) rn2 <- paste("Дата пробы", pref)
+
+      for (k in seq_along(cols)){
+        v <- norm_txt(cell(i, cols[k])); if (is.na(v)) next
+        key <- if (tt) norm_txt(paste(rn2, hs[k])) else norm_txt(paste(hs[k], rn2))
+        add(key, v)
+      }
+      i <- i+1
+    }
+  }
+  out
+}
+
+sheets <- excel_sheets(report_file)
+
+# ---- patients_raw tidy ----
+patients_raw <- map_dfr(sheets, function(sh){
+  m <- extract_one_sheet(report_file, sh); nm <- names(m)
+
+  tps <- unique(na.omit(map_chr(nm[str_detect(nm, "\\bТочка\\b")], tp_code)))
+  if (!length(tps)) tps <- NA_character_
+
+  static <- setNames(
+    as.list(map_chr(norm_txt(ds$ru), ~ {v <- m[[.x]]; if (is.null(v)) NA_character_ else v})),
+    ds$short
+  ) %>% as_tibble()
+
+  dyn_list <- map(seq_len(nrow(dt)), function(i){
+    ru <- norm_txt(dt$ru[i]); var <- dt$short[i]
+    ks <- nm[str_starts(nm, paste0(ru, " Точка"))]
+    if (!length(ks)) return(NULL)
+    tibble(timepoint = map_chr(ks, tp_code),
+           value = unname(map_chr(ks, ~ m[[.x]]))) %>%
+      filter(!is.na(timepoint)) %>%
+      group_by(timepoint) %>%
+      summarise(!!var := paste(na.omit(unique(value)), collapse=" | "), .groups="drop")
+  }) %>% compact()
+
+  dynamic <- if (length(dyn_list)) reduce(dyn_list, full_join, by="timepoint") else tibble(timepoint = tps)
+  out <- bind_cols(dynamic, static[rep(1, nrow(dynamic)), , drop=FALSE])
+
+  if (!("pat_record_id" %in% names(out))) {
+    id <- m[["ID записи"]]
+    out$pat_record_id <- if (is.null(id)) NA_character_ else id
+  }
+
+  out %>% select(pat_record_id, timepoint, everything())
+})
+
+write.xlsx(patients_raw, patients_out, asTable = TRUE, overwrite = TRUE)
+
+# ---- HA_raw (всё строками) ----
+ha_extract <- function(f, sh){
+  raw <- read_excel(f, sheet = sh, col_names = FALSE, na = c("", "Нет данных", "Нет данных ")) %>%
+    mutate(across(everything(), norm_txt))
+  c1 <- names(raw)[1]; vc <- names(raw)[-1]
+
+  id <- raw %>% filter(str_to_lower(.data[[c1]])=="id записи") %>% pull(!!sym(vc[1])) %>% first()
+
+  s <- which(str_to_upper(raw[[c1]])=="ПАРАМЕТРЫ ГЕМОСОРБЦИИ")[1]
+  if (is.na(s)) return(tibble())
+  e <- which(str_to_upper(raw[[c1]])=="КЛИНИЧЕСКАЯ ОЦЕНКА")[1]
+  if (is.na(e) || e<=s) e <- nrow(raw)+1
+
+  b <- raw[(s+1):(e-1), , drop=FALSE]
+  need <- c("Параметр","Тип устройства","Серийный номер устройства","Начало процедуры",
+            "Длительность ГС (ч)","Средняя скорость потока крови (мл/мин)",
+            "Антикоагуляция","Антикоагуляция (другой)",
+            "Комбинация с другими экстракорпоральными методами","Нежелательные явления")
+  b <- b %>% filter(.data[[c1]] %in% need)
+  if (!any(b[[c1]]=="Параметр")) return(tibble())
+
+  pr <- b %>% filter(.data[[c1]]=="Параметр") %>% slice(1)
+  pn <- as.character(pr[1, vc]); idx <- which(!is.na(pn) & pn!="")
+  if (!length(idx)) return(tibble())
+
+  gv <- function(lbl, col) b %>% filter(.data[[c1]]==lbl) %>% pull(!!sym(col)) %>% first()
+
+  map_dfr(idx, function(k){
+    col <- vc[k]
+    tibble(
+      pat_record_id = id,
+      HA_parameter = pn[k],
+      HA_cartrige_type = gv("Тип устройства", col),
+      HA_serial_number = gv("Серийный номер устройства", col),
+      HA_start_datetime = gv("Начало процедуры", col),
+      HA_duration = gv("Длительность ГС (ч)", col),
+      HA_avg_blood_flow = gv("Средняя скорость потока крови (мл/мин)", col),
+      HA_anticoagulation = gv("Антикоагуляция", col),
+      HA_anticoagulation_other = gv("Антикоагуляция (другой)", col),
+      HA_other_methods = gv("Комбинация с другими экстракорпоральными методами", col),
+      HA_adverse_effects = gv("Нежелательные явления", col)
+    )
+  }) %>% filter(!is.na(HA_parameter) & HA_parameter!="")
+}
+
+HA_raw <- map_dfr(sheets, ~ ha_extract(report_file, .x))
+write.xlsx(HA_raw, ha_out, asTable = TRUE, overwrite = TRUE)
+
+
+```
+
+```{r}
+#| echo: false
+2 * 2
+```
