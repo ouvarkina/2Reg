@@ -1,10 +1,17 @@
 ---
-title: "2Reg"
-format: html
-editor: visual
+title: "2Reg report"
+format:
+  html:
+    toc: true
+execute:
+  echo: false
+  warning: false
+  message: false
 ---
 
 ```{r}
+#| label: setup
+#| include: false
 
 suppressPackageStartupMessages({
   library(readxl); library(dplyr); library(purrr); library(stringr)
@@ -13,16 +20,33 @@ suppressPackageStartupMessages({
 
 report_file  <- "Отчет_все_записи_12.01.2026-2.xlsx"
 dict_file    <- "2Reg_Dictionary_tidy.xlsx"
-patients_out <- "2Reg_patients_raw.xlsx"   # tidy: 1 пациент × timepoint
-ha_out       <- "2Reg_HA_raw.xlsx"         # long: 1 процедура × строка
+patients_out <- "2Reg_patients_tidy.xlsx"
+ha_out       <- "2Reg_HA_tidy.xlsx"
 
+save_xlsx <- FALSE
+```
+
+```{r}
+#| label: etl
+#| cache: true
+#| echo: true
+
+# Ожидается, что эти переменные заданы снаружи:
+# report_file, dict_file, patients_out, ha_out, save_xlsx
+
+# ------------------------- helpers -------------------------
+
+# Нормализация текста для сопоставления ключей (пробелы, дефисы, пустые строки)
 norm_txt <- function(x){
   x <- as.character(x)
   x <- str_replace_all(x, "\u00A0", " ")
   x <- str_replace_all(x, "[\u2212\u2013\u2014]", "-")
-  x <- str_squish(x); x[x==""] <- NA_character_; x
+  x <- str_squish(x)
+  x[x == ""] <- NA_character_
+  x
 }
 
+# Из заголовка вида "Точка [-12;0] часов/сут" формируем код timepoint (m12h_0h, m4d_6d и т.п.)
 tp_code <- function(s){
   s <- norm_txt(s); if (is.na(s)) return(NA_character_)
   u <- if (str_detect(str_to_lower(s), "сут|дн")) "d" else "h"
@@ -32,22 +56,83 @@ tp_code <- function(s){
   paste0(f(as.integer(m[1,2])), "_", f(as.integer(m[1,3])))
 }
 
-# ---- dictionary (tidy) ----
+# Приведение служебных значений к NA (в т.ч. переносы строк)
+clean_na <- function(x){
+  x <- as.character(x)
+  x <- str_replace_all(x, "[\r\n]", " ")
+  x <- str_squish(x)
+  xl <- str_to_lower(x)
+  x[xl %in% c("нет значения","нет данных","n/a","na")] <- NA_character_
+  x[x == ""] <- NA_character_
+  x
+}
+
+# Извлекаем первое число из строки (учитываем десятичную запятую и склейки " | ")
+to_num <- function(x){
+  x <- clean_na(x)
+  x <- str_split_fixed(x, "\\s*\\|\\s*", 2)[,1]
+  m <- str_extract(x, "[-+]?\\d+(?:[\\.,]\\d+)?")
+  as.numeric(str_replace_all(m, ",", "."))
+}
+
+# Разделяем "число + единицы". Для procalcitonin обрабатываем <x и >x (x/2 и x*2)
+split_val_unit <- function(x, impute_ineq = FALSE){
+  x <- clean_na(x)
+  x <- str_split_fixed(x, "\\s*\\|\\s*", 2)[,1]
+  m <- str_match(x, "^\\s*([<>]=?|≤|≥)?\\s*([-+]?\\d+(?:[\\.,]\\d+)?)\\s*(.*)$")
+  op <- str_trim(m[,2])
+  val <- suppressWarnings(as.numeric(str_replace_all(m[,3], ",", ".")))
+  unit <- str_squish(m[,4]); unit[unit == ""] <- NA_character_
+  if (impute_ineq) val <- case_when(
+    op %in% c("<","<=","≤") ~ val/2,
+    op %in% c(">",">=","≥") ~ val*2,
+    TRUE ~ val
+  )
+  list(value = val, unit = unit)
+}
+
+# Переставляем *_unit сразу после соответствующей числовой колонки
+reorder_units <- function(df, bases){
+  bases <- intersect(bases, names(df))
+  fixed <- intersect(c("pat_record_id","timepoint"), names(df))
+  pairs <- unlist(lapply(bases, function(b){
+    u <- paste0(b, "_unit")
+    if (u %in% names(df)) c(b, u) else b
+  }), use.names = FALSE)
+  used <- unique(c(fixed, pairs))
+  rest <- setdiff(names(df), used)
+  df %>% select(any_of(fixed), any_of(pairs), all_of(rest))
+}
+
+# ------------------------- dictionary -------------------------
+
+# Словарь tidy: short, ru, kind (static/time)
 dict <- read_excel(dict_file) %>%
   transmute(short = as.character(short), ru = as.character(ru), kind = as.character(kind)) %>%
   mutate(across(c(short, ru, kind), norm_txt))
 
-ds <- dict %>% filter(kind == "static")
-dt <- dict %>% filter(kind == "time")
+ds <- filter(dict, kind == "static")
+dt <- filter(dict, kind == "time")
+ru_to_short <- setNames(dt$short, dt$ru)  # ru (база) -> имя переменной
 
-# ---- sheet -> map(key->value) ----
+# --------------------- sheet extraction ----------------------
+
+# Читаем лист и собираем соответствия key -> value.
+# Для таблиц с timepoints ключи формируем так, чтобы включить "Точка [...]".
 extract_one_sheet <- function(f, sh){
-  x <- read_excel(f, sheet = sh, col_names = FALSE, na = c("", "Нет данных", "Нет данных ")) %>%
+  x <- read_excel(
+    f, sheet = sh, col_names = FALSE,
+    na = c("", "Нет данных", "Нет значения", "Нет значения\r")
+  ) %>%
     mutate(across(everything(), ~ if_else(is.na(.x), NA_character_, as.character(.x))))
+
   nr <- nrow(x); nc <- ncol(x)
   cell <- function(i,j) if (i<1||i>nr||j<1||j>nc) NA_character_ else x[[j]][i]
   empty_row <- function(i) all(is.na(map_chr(seq_len(nc), ~ norm_txt(cell(i,.x)))))
-  sect <- function(i){ c1 <- norm_txt(cell(i,1)); !is.na(c1) && all(is.na(map_chr(2:nc, ~ norm_txt(cell(i,.x))))) }
+  sect <- function(i){
+    c1 <- norm_txt(cell(i,1))
+    !is.na(c1) && all(is.na(map_chr(2:nc, ~ norm_txt(cell(i,.x)))))
+  }
 
   out <- list()
   add <- function(k,v){
@@ -58,113 +143,163 @@ extract_one_sheet <- function(f, sh){
     } else out[[k]] <<- v
   }
 
+  # Простые строки: параметр в 1-й колонке, значения в остальных
   for (i in seq_len(nr)) {
-    k <- norm_txt(cell(i,1)); if (is.na(k) || k=="Параметр") next
+    k <- norm_txt(cell(i,1))
+    if (is.na(k) || k == "Параметр") next
     v <- map_chr(2:nc, ~ norm_txt(cell(i,.x))); v <- v[!is.na(v)]
     if (length(v)) add(k, paste(v, collapse=" | "))
   }
 
-  pr <- which(norm_txt(x[[1]])=="Параметр")
+  # Подтаблицы: строки, где в 1-й колонке стоит "Параметр"
+  pr <- which(norm_txt(x[[1]]) == "Параметр")
   for (st in pr){
     hdr <- map_chr(2:nc, ~ norm_txt(cell(st,.x)))
-    cols <- which(!is.na(hdr)) + 1; hs <- hdr[!is.na(hdr)]
+    cols <- which(!is.na(hdr)) + 1
+    hs <- hdr[!is.na(hdr)]
     tt <- any(str_detect(hs, regex("\\bТочка\\b", TRUE)))
 
+    # Название секции нужно, чтобы различать одинаковые строки (например "Дата пробы")
     title <- NA_character_
-    if (st>1) for (t in seq(st-1,1,-1)) if (sect(t)) { title <- norm_txt(cell(t,1)); break }
+    if (st > 1) for (t in seq(st-1, 1, -1)) if (sect(t)) { title <- norm_txt(cell(t,1)); break }
 
     pref <- NA_character_
     if (!is.na(title)) {
-      if (str_detect(str_to_upper(title), "КЛЕТКИ")) pref <- "Клетки крови"
+      if (str_detect(str_to_upper(title), "КЛЕТКИ"))   pref <- "Клетки крови"
       if (str_detect(str_to_upper(title), "БИОХИМИЯ")) pref <- "Биохимия"
     }
 
-    i <- st+1
-    while (i<=nr){
+    i <- st + 1
+    while (i <= nr){
       rn <- norm_txt(cell(i,1))
       if (is.na(rn)) { if (empty_row(i)) break; i <- i+1; next }
-      if (rn=="Параметр") break
+      if (rn == "Параметр") break
 
       rn2 <- rn
-      if (tt && rn=="Дата проведения" && !is.na(title) && str_detect(str_to_upper(title), "КЛИНИЧЕСКАЯ ОЦЕНКА"))
-        rn2 <- "Дата клинической оценки"
-      if (tt && rn=="Дата пробы" && !is.na(pref)) rn2 <- paste("Дата пробы", pref)
+      # Уточняем строку "Дата проведения" внутри клинической оценки
+      if (tt && rn == "Дата проведения" && !is.na(title) &&
+          str_detect(str_to_upper(title), "КЛИНИЧЕСКАЯ ОЦЕНКА")) rn2 <- "Дата клинической оценки"
+      # Различаем "Дата пробы" для клеток крови и биохимии
+      if (tt && rn == "Дата пробы" && !is.na(pref)) rn2 <- paste("Дата пробы", pref)
 
       for (k in seq_along(cols)){
         v <- norm_txt(cell(i, cols[k])); if (is.na(v)) next
         key <- if (tt) norm_txt(paste(rn2, hs[k])) else norm_txt(paste(hs[k], rn2))
         add(key, v)
       }
-      i <- i+1
+      i <- i + 1
     }
   }
+
   out
 }
 
+# --------------------- patients_tidy ----------------------
+
 sheets <- excel_sheets(report_file)
 
-# ---- patients_raw tidy ----
-patients_raw <- map_dfr(sheets, function(sh){
-  m <- extract_one_sheet(report_file, sh); nm <- names(m)
+patients_tidy <- map_dfr(sheets, function(sh){
+  m <- extract_one_sheet(report_file, sh)
+  nm <- names(m)
 
-  tps <- unique(na.omit(map_chr(nm[str_detect(nm, "\\bТочка\\b")], tp_code)))
-  if (!length(tps)) tps <- NA_character_
-
+  # Static: значения не зависят от timepoint
   static <- setNames(
     as.list(map_chr(norm_txt(ds$ru), ~ {v <- m[[.x]]; if (is.null(v)) NA_character_ else v})),
     ds$short
   ) %>% as_tibble()
 
-  dyn_list <- map(seq_len(nrow(dt)), function(i){
-    ru <- norm_txt(dt$ru[i]); var <- dt$short[i]
-    ks <- nm[str_starts(nm, paste0(ru, " Точка"))]
-    if (!length(ks)) return(NULL)
-    tibble(timepoint = map_chr(ks, tp_code),
-           value = unname(map_chr(ks, ~ m[[.x]]))) %>%
-      filter(!is.na(timepoint)) %>%
-      group_by(timepoint) %>%
-      summarise(!!var := paste(na.omit(unique(value)), collapse=" | "), .groups="drop")
-  }) %>% compact()
+  # Dynamic: все ключи, содержащие "Точка", распаковываем в (timepoint, var, value)
+  dyn_keys <- nm[str_detect(nm, "\\bТочка\\b")]
+  dyn <- tibble(
+    key = dyn_keys,
+    value = unname(map_chr(dyn_keys, ~ m[[.x]])),
+    timepoint = map_chr(dyn_keys, tp_code),
+    ru_base = norm_txt(str_remove(dyn_keys, "\\s*Точка\\b.*$"))
+  ) %>%
+    mutate(var = unname(ru_to_short[ru_base])) %>%
+    filter(!is.na(timepoint), !is.na(var)) %>%
+    group_by(timepoint, var) %>%
+    summarise(value = paste(na.omit(unique(value)), collapse = " | "), .groups = "drop")
 
-  dynamic <- if (length(dyn_list)) reduce(dyn_list, full_join, by="timepoint") else tibble(timepoint = tps)
-  out <- bind_cols(dynamic, static[rep(1, nrow(dynamic)), , drop=FALSE])
+  # Быстрое приведение из long в wide по var (base::reshape)
+  dyn_w <- if (nrow(dyn) == 0) {
+    tibble(timepoint = NA_character_)
+  } else {
+    dw <- reshape(as.data.frame(dyn), idvar = "timepoint", timevar = "var", direction = "wide")
+    names(dw) <- sub("^value\\.", "", names(dw))
+    as_tibble(dw)
+  }
 
+  out <- bind_cols(dyn_w, static[rep(1, nrow(dyn_w)), , drop = FALSE])
+
+  # ID пациента нужен всегда (если не приходит из словаря — берём из служебной информации)
   if (!("pat_record_id" %in% names(out))) {
     id <- m[["ID записи"]]
     out$pat_record_id <- if (is.null(id)) NA_character_ else id
   }
 
   out %>% select(pat_record_id, timepoint, everything())
-})
+}) %>%
+  mutate(across(everything(), clean_na))
 
-write.xlsx(patients_raw, patients_out, asTable = TRUE, overwrite = TRUE)
+# Поля, которые должны быть числовыми
+num_cols <- c(
+  "SOFA","VIS2020","avg_BP","leucocytes","neutrophils","lymphocytes","thrombocytes",
+  "age_yr","age_m","BMI","charlson_index",
+  "vasopressors_dur_days","vasopressors_dur_hours",
+  "MV_dur_days","MV_dur_hours",
+  "RRT_dur_days","RRT_dur_hours",
+  "ECMO_dur_days","ECMO_dur_hours",
+  "SpFiO2","PaFiO2"
+)
+num_cols <- intersect(num_cols, names(patients_tidy))
+patients_tidy <- patients_tidy %>% mutate(across(all_of(num_cols), to_num))
 
-# ---- HA_raw (всё строками) ----
+# Поля вида "число + единицы измерения" -> value + *_unit
+unit_bases <- c(
+  "lactate","creatinine","albumin","C_react_protein","procalcitonin",
+  "D_dimer","fibrinogen","bilirubin_total"
+)
+unit_bases <- intersect(unit_bases, names(patients_tidy))
+
+for (col in unit_bases) {
+  sp <- split_val_unit(patients_tidy[[col]], impute_ineq = (col == "procalcitonin"))
+  patients_tidy[[col]] <- sp$value
+  patients_tidy[[paste0(col, "_unit")]] <- sp$unit
+}
+patients_tidy <- reorder_units(patients_tidy, unit_bases)
+
+# ------------------------ HA_tidy -------------------------
+
+# Извлекаем параметры гемосорбции: одна процедура = одна строка
 ha_extract <- function(f, sh){
   raw <- read_excel(f, sheet = sh, col_names = FALSE, na = c("", "Нет данных", "Нет данных ")) %>%
     mutate(across(everything(), norm_txt))
   c1 <- names(raw)[1]; vc <- names(raw)[-1]
 
-  id <- raw %>% filter(str_to_lower(.data[[c1]])=="id записи") %>% pull(!!sym(vc[1])) %>% first()
+  id <- raw %>%
+    filter(str_to_lower(.data[[c1]]) == "id записи") %>%
+    pull(!!rlang::sym(vc[1])) %>% first()
 
-  s <- which(str_to_upper(raw[[c1]])=="ПАРАМЕТРЫ ГЕМОСОРБЦИИ")[1]
+  s <- which(str_to_upper(raw[[c1]]) == "ПАРАМЕТРЫ ГЕМОСОРБЦИИ")[1]
   if (is.na(s)) return(tibble())
-  e <- which(str_to_upper(raw[[c1]])=="КЛИНИЧЕСКАЯ ОЦЕНКА")[1]
-  if (is.na(e) || e<=s) e <- nrow(raw)+1
+  e <- which(str_to_upper(raw[[c1]]) == "КЛИНИЧЕСКАЯ ОЦЕНКА")[1]
+  if (is.na(e) || e <= s) e <- nrow(raw) + 1
 
-  b <- raw[(s+1):(e-1), , drop=FALSE]
+  b <- raw[(s+1):(e-1), , drop = FALSE]
   need <- c("Параметр","Тип устройства","Серийный номер устройства","Начало процедуры",
             "Длительность ГС (ч)","Средняя скорость потока крови (мл/мин)",
             "Антикоагуляция","Антикоагуляция (другой)",
             "Комбинация с другими экстракорпоральными методами","Нежелательные явления")
   b <- b %>% filter(.data[[c1]] %in% need)
-  if (!any(b[[c1]]=="Параметр")) return(tibble())
+  if (!any(b[[c1]] == "Параметр")) return(tibble())
 
-  pr <- b %>% filter(.data[[c1]]=="Параметр") %>% slice(1)
-  pn <- as.character(pr[1, vc]); idx <- which(!is.na(pn) & pn!="")
+  pr <- b %>% filter(.data[[c1]] == "Параметр") %>% slice(1)
+  pn <- as.character(pr[1, vc]); idx <- which(!is.na(pn) & pn != "")
   if (!length(idx)) return(tibble())
 
-  gv <- function(lbl, col) b %>% filter(.data[[c1]]==lbl) %>% pull(!!sym(col)) %>% first()
+  gv <- function(lbl, col) b %>% filter(.data[[c1]] == lbl) %>%
+    pull(!!rlang::sym(col)) %>% first()
 
   map_dfr(idx, function(k){
     col <- vc[k]
@@ -181,16 +316,29 @@ ha_extract <- function(f, sh){
       HA_other_methods = gv("Комбинация с другими экстракорпоральными методами", col),
       HA_adverse_effects = gv("Нежелательные явления", col)
     )
-  }) %>% filter(!is.na(HA_parameter) & HA_parameter!="")
+  }) %>% filter(!is.na(HA_parameter) & HA_parameter != "")
 }
 
-HA_raw <- map_dfr(sheets, ~ ha_extract(report_file, .x))
-write.xlsx(HA_raw, ha_out, asTable = TRUE, overwrite = TRUE)
+HA_tidy <- map_dfr(sheets, ~ ha_extract(report_file, .x))
 
+# ------------------------ output --------------------------
+
+# Сохранение в xlsx включается флагом save_xlsx
+if (isTRUE(save_xlsx)) {
+  write.xlsx(patients_tidy, patients_out, asTable = TRUE, overwrite = TRUE)
+  write.xlsx(HA_tidy, ha_out, asTable = TRUE, overwrite = TRUE)
+}
 
 ```
 
 ```{r}
-#| echo: false
-2 * 2
+#| label: summary
+#| cache: true
+
+list(
+patients_rows = nrow(patients_tidy),
+patients_cols = ncol(patients_tidy),
+ha_rows = nrow(HA_tidy),
+ha_cols = ncol(HA_tidy)
+)
 ```
