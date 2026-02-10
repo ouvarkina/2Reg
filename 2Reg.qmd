@@ -21,11 +21,21 @@ execute:
 ```{r}
 
 #| label: setup
+#| cache: true
 #| include: false
 
 suppressPackageStartupMessages({
-  library(readxl); library(dplyr); library(purrr); library(stringr)
-  library(tibble); library(openxlsx)
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(stringr)
+  library(tibble)
+  library(openxlsx)
+  library(lubridate)
+  library(gtsummary)
+  library(ggplot2)
+  library(rlang)
 })
 
 report_file  <- "Отчет_все_записи_12.01.2026-2.xlsx"
@@ -37,15 +47,14 @@ fmt_int <- function(x) formatC(as.integer(round(x)), format = "f", digits = 0)
 fmt_1   <- function(x) formatC(x, format = "f", digits = 1)
 fmt_2   <- function(x) formatC(x, format = "f", digits = 2)
 
-save_xlsx <- FALSE 
+save_xlsx <- FALSE
 ```
 
 ```{r}
 
 #| label: etl
-#| include: false
 #| cache: true
-#| echo: true
+#| include: false
 
 # Ожидается, что эти переменные заданы снаружи:
 # report_file, dict_file, patients_out, ha_out, save_xlsx
@@ -147,6 +156,48 @@ dur_to_hours <- function(x){
   # Явно нормализуем -0 к 0 (на всякий случай)
   out[!is.na(out) & abs(out) < 1e-12] <- 0
   out
+}
+
+
+
+# ------------------------- datetime helpers -------------------------
+
+# Универсальный парсер дат/времени: строки разных форматов + Excel-числа.
+# tz оставляем "UTC" как "нейтральную" шкалу времени.
+parse_dt <- function(x, tz = "UTC") {
+  x <- clean_na(x)
+  x <- str_replace_all(x, "\u00A0", " ")
+  x <- str_squish(x)
+  x[x == ""] <- NA_character_
+
+  out <- rep(as.POSIXct(NA, tz = tz), length(x))
+
+  # Excel serial numbers (дата как число)
+  x_num <- suppressWarnings(as.numeric(str_replace_all(x, ",", ".")))
+  is_num <- !is.na(x_num) & str_detect(x, "^\\d+(?:[\\.,]\\d+)?$")
+  if (any(is_num)) {
+    out[is_num] <- as.POSIXct(x_num[is_num] * 86400, origin = "1899-12-30", tz = tz)
+  }
+
+  idx <- which(!is_num & !is.na(x))
+  if (length(idx)) {
+    out[idx] <- suppressWarnings(lubridate::parse_date_time(
+      x[idx],
+      orders = c("dmy HMS","dmy HM","dmy", "ymd HMS","ymd HM","ymd", "mdy HMS","mdy HM","mdy"),
+      tz = tz
+    ))
+  }
+  out
+}
+
+# Добавляет новую datetime-колонку (new) из исходной (src), если src есть; иначе создаёт NA.
+add_dt <- function(df, src, new, tz = "UTC") {
+  if (src %in% names(df)) {
+    df[[new]] <- suppressWarnings(parse_dt(df[[src]], tz = tz))
+  } else {
+    df[[new]] <- as.POSIXct(NA, tz = tz)
+  }
+  df
 }
 
 # ------------------------- dictionary -------------------------
@@ -435,6 +486,87 @@ HA_tidy <- HA_tidy %>%
     LPS_count = if_else(is.na(LPS_count), 0L, as.integer(LPS_count))
   )
 
+# ------------------ postprocess (no повторов в аналитике) ------------------
+
+# patients: datetime-колонки (создаём *всегда*, даже если исходной колонки нет)
+patients_tidy <- patients_tidy %>%
+  add_dt("ICU_in_datetime", "ICU_in_dt") %>%
+  add_dt("antibiotics_start_datetime", "antibiotics_start_dt") %>%
+  add_dt("RRT_start", "RRT_start_dt") %>%
+  add_dt("RRT_resolution", "RRT_resolution_dt") %>%
+  add_dt("MV_start", "MV_start_dt") %>%
+  add_dt("MV_resolution", "MV_resolution_dt")
+
+# VIS2020: анализируем только >0, но исходник сохраняем
+if ("VIS2020" %in% names(patients_tidy)) {
+  patients_tidy <- patients_tidy %>%
+    mutate(
+      VIS2020_raw = VIS2020,
+      VIS2020 = if_else(!is.na(VIS2020) & VIS2020 > 0, VIS2020, NA_real_)
+    )
+}
+
+# NLR: один раз на всех timepoint
+if (all(c("neutrophils","lymphocytes") %in% names(patients_tidy))) {
+  patients_tidy <- patients_tidy %>%
+    mutate(
+      NLR = if_else(
+        !is.na(neutrophils) & !is.na(lymphocytes) & lymphocytes > 0,
+        neutrophils / lymphocytes,
+        NA_real_
+      )
+    )
+}
+
+# fibrinogen: приводим g/dl -> mg/dl (×1000) один раз, чтобы везде было одинаково
+if (all(c("fibrinogen","fibrinogen_unit") %in% names(patients_tidy))) {
+  fu <- str_to_lower(str_squish(as.character(patients_tidy$fibrinogen_unit)))
+  is_gdl  <- !is.na(fu) & str_detect(fu, "^(г|g)\\s*/\\s*(дл|dl)\\.?$")
+  is_mgdl <- !is.na(fu) & str_detect(fu, "^(мг|mg)\\s*/\\s*(дл|dl)\\.?$")
+  patients_tidy$fibrinogen <- ifelse(is_gdl & !is.na(patients_tidy$fibrinogen),
+                                     patients_tidy$fibrinogen * 1000,
+                                     patients_tidy$fibrinogen)
+  patients_tidy$fibrinogen_unit <- ifelse(is_gdl | is_mgdl, "мг/дл", patients_tidy$fibrinogen_unit)
+}
+
+# HA: datetime + нормализация типа картриджа
+HA_tidy <- HA_tidy %>%
+  add_dt("HA_start_datetime", "HA_start_dt") %>%
+  mutate(
+    HA_cartrige_type_std = str_to_upper(str_squish(as.character(HA_cartrige_type)))
+  )
+
+# Когорты для парных сравнений (LPS в первые 72 часа от ICU)
+icu_by_id <- patients_tidy %>%
+  group_by(pat_record_id) %>%
+  summarise(ICU_in_dt = first(na.omit(ICU_in_dt)), .groups = "drop") %>%
+  mutate(ICU_in_plus72 = ICU_in_dt + hours(72))
+
+ids_lps_72h <- HA_tidy %>%
+  inner_join(icu_by_id, by = "pat_record_id") %>%
+  filter(
+    HA_cartrige_type_std == "LPS",
+    !is.na(HA_start_dt),
+    !is.na(ICU_in_dt),
+    HA_start_dt >= ICU_in_dt,
+    HA_start_dt <= ICU_in_plus72
+  ) %>%
+  distinct(pat_record_id)
+
+# Показания к гемосорбции: читаем один раз (если файл есть)
+diag_file <- "2Reg_diagnoses.xlsx"
+if (!file.exists(diag_file) && file.exists("/mnt/data/2Reg_diagnoses.xlsx")) {
+  diag_file <- "/mnt/data/2Reg_diagnoses.xlsx"
+}
+
+diag_wide <- NULL
+if (file.exists(diag_file)) {
+  diag_wide <- tryCatch(
+    readxl::read_excel(diag_file, sheet = 2),
+    error = function(e) NULL
+  )
+}
+
 # ------------------------ output --------------------------
 
 if (isTRUE(save_xlsx)) {
@@ -444,20 +576,15 @@ if (isTRUE(save_xlsx)) {
 ```
 
 ```{r}
+#| label: gtsummary_pat
+#| cache: true
+#| echo: false
 
-#| label: gtsummary_m12h_0h
-#| echo: true
-#| results: asis
+tp_top <- "m12h_0h"
+tps_bottom <- c("m12h_0h", "48h_72h", "4d_6d", "7d_10d")
+show_antibiotics <- FALSE  # временно скрыто
 
-library(dplyr)
-library(stringr)
-library(lubridate)
-library(gtsummary)
-
-tp <- "m12h_0h"
-show_antibiotics <- FALSE  # временно скрыто 
-
-# RU-лейблы из словаря
+# RU-лейблы из словаря (dict_pat уже создан в ETL)
 ru_map <- dict_pat %>%
   distinct(short, ru) %>%
   filter(!is.na(short), short != "", !is.na(ru), ru != "") %>%
@@ -466,11 +593,6 @@ ru_map <- dict_pat %>%
 ru_or <- function(key) {
   x <- unname(ru_map[[key]])
   if (is.null(x) || is.na(x) || x == "") key else x
-}
-
-parse_dt <- function(x, tz = "UTC") {
-  x <- as.character(x)
-  suppressWarnings(coalesce(dmy_hm(x, tz = tz), ymd_hm(x, tz = tz)))
 }
 
 unit_mode <- function(x) {
@@ -484,44 +606,36 @@ lab_u <- function(base_ru, unit) {
   if (!is.na(unit) && unit != "") paste0(base_ru, " (", unit, ")") else base_ru
 }
 
-# 1 строка на пациента для выбранной временной точки
-pt <- patients_tidy %>%
-  filter(timepoint == tp) %>%
+# ---------------- data: верх (только m12h_0h) ----------------
+pt_top <- patients_tidy %>%
+  filter(timepoint == tp_top) %>%
   distinct(pat_record_id, .keep_all = TRUE) %>%
   mutate(
-    ICU_in_dt = parse_dt(ICU_in_datetime, tz = "UTC"),
-
     vasopressors_used = case_when(
       str_to_lower(vasopressors_if_used) == "да"  ~ "Да",
       str_to_lower(vasopressors_if_used) == "нет" ~ "Нет",
       TRUE ~ NA_character_
     ),
-    vasopressors_used = factor(vasopressors_used, levels = c("Да","Нет")),
-
-    # только для VIS2020>0
-    VIS2020_pos = if_else(!is.na(VIS2020) & VIS2020 > 0, VIS2020, NA_real_)
+    vasopressors_used = factor(vasopressors_used, levels = c("Да","Нет"))
   )
 
-if (isTRUE(show_antibiotics)) {
-  pt <- pt %>%
+if (isTRUE(show_antibiotics) && "antibiotics_start_dt" %in% names(pt_top)) {
+  pt_top <- pt_top %>%
     mutate(
-      antibiotics_start_dt = parse_dt(antibiotics_start_datetime, tz = "UTC"),
       antibiotics_started = if_else(!is.na(antibiotics_start_dt), "Да", "Нет"),
       antibiotics_started = factor(antibiotics_started, levels = c("Да","Нет"))
     )
 }
 
-# HA_start для "Гемоперфузия 1"
+# ---------------- HA: время старта "Гемоперфузия 1" + counts ----------------
 ha1 <- HA_tidy %>%
   filter(HA_parameter == "Гемоперфузия 1") %>%
-  mutate(HA_start_dt = parse_dt(HA_start_datetime, tz = "UTC")) %>%
   group_by(pat_record_id) %>%
   summarise(
     HA1_start_dt = if (all(is.na(HA_start_dt))) as.POSIXct(NA, tz = "UTC") else min(HA_start_dt, na.rm = TRUE),
     .groups = "drop"
   )
 
-# устройства/пациента (CT, LPS и сумма) — упрощённо (из ETL уже посчитано)
 ha_counts <- HA_tidy %>%
   distinct(pat_record_id, CT_count, LPS_count) %>%
   mutate(
@@ -530,7 +644,7 @@ ha_counts <- HA_tidy %>%
     devices_total = CT_count + LPS_count
   )
 
-pt <- pt %>%
+pt_top <- pt_top %>%
   left_join(ha1, by = "pat_record_id") %>%
   left_join(ha_counts, by = "pat_record_id") %>%
   mutate(
@@ -541,31 +655,33 @@ pt <- pt %>%
     LPS_count_pos     = if_else(!is.na(LPS_count) & LPS_count > 0, as.integer(LPS_count), NA_integer_),
     devices_total_pos = if_else(!is.na(devices_total) & devices_total > 0, as.integer(devices_total), NA_integer_),
 
-    # фибриноген: если г/дл (g/dl) -> мг/дл (×1000)
-    fibrinogen_unit = if_else(!is.na(fibrinogen_unit), str_squish(fibrinogen_unit), fibrinogen_unit),
-    fibrinogen = case_when(
-      !is.na(fibrinogen) & !is.na(fibrinogen_unit) &
-        str_detect(str_to_lower(fibrinogen_unit), "^(г|g)\\s*/\\s*(дл|dl)\\.?$") ~ fibrinogen * 1000,
-      TRUE ~ fibrinogen
+    # ----- RRT/MV required относительно HA1_start_dt -----
+    RRT_required = case_when(
+      is.na(RRT_start_dt) ~ "Нет",
+      is.na(HA1_start_dt) ~ NA_character_,
+      HA1_start_dt >= (RRT_start_dt - hours(12)) &
+        (is.na(RRT_resolution_dt) | HA1_start_dt <= RRT_resolution_dt) ~ "Да",
+      TRUE ~ "Нет"
     ),
-    fibrinogen_unit = case_when(
-      !is.na(fibrinogen_unit) & str_detect(str_to_lower(fibrinogen_unit), "^(г|g)\\s*/\\s*(дл|dl)\\.?$") ~ "мг/дл",
-      !is.na(fibrinogen_unit) & str_detect(str_to_lower(fibrinogen_unit), "^(мг|mg)\\s*/\\s*(дл|dl)\\.?$") ~ "мг/дл",
-      TRUE ~ fibrinogen_unit
+    MV_required = case_when(
+      is.na(MV_start_dt) ~ "Нет",
+      is.na(HA1_start_dt) ~ NA_character_,
+      HA1_start_dt >= (MV_start_dt - hours(12)) &
+        (is.na(MV_resolution_dt) | HA1_start_dt <= MV_resolution_dt) ~ "Да",
+      TRUE ~ "Нет"
     ),
 
-    # NLR = neutrophils / lymphocytes
-    NLR = if_else(
-      !is.na(neutrophils) & !is.na(lymphocytes) & lymphocytes > 0,
-      neutrophils / lymphocytes,
-      NA_real_
-    )
+    RRT_required = factor(RRT_required, levels = c("Да","Нет")),
+    MV_required  = factor(MV_required,  levels = c("Да","Нет"))
   )
 
-# ---------------- верхняя часть ----------------
+# ---------------- верхняя часть  ----------------
 vars_top <- c(
   "age_yr","sex","BMI","ICU_6_month_history","from_other_ICU_transfer",
-  "icu_to_HA1_hours","vasopressors_used","charlson_index",
+  "icu_to_HA1_hours",
+  "vasopressors_used","RRT_required","MV_required",
+  "charlson_index",
+  "pat_bacteremia","pat_gram_negative","pat_gram_positive","pat_fungal",
   "CT_count_pos","LPS_count_pos","devices_total_pos",
   "HA_efficency_CGI_E","outcome"
 )
@@ -578,7 +694,13 @@ lbl_top <- list(
   from_other_ICU_transfer = ru_or("from_other_ICU_transfer"),
   icu_to_HA1_hours = "Время между поступлением в ОРИТ и началом ГС, ч",
   vasopressors_used = "Потребность в вазопрессорах",
+  RRT_required = "Потребность в ЗПТ",
+  MV_required  = "Потребность в ИВЛ",
   charlson_index = ru_or("charlson_index"),
+  pat_bacteremia    = ru_or("pat_bacteremia"),
+  pat_gram_negative = ru_or("pat_gram_negative"),
+  pat_gram_positive = ru_or("pat_gram_positive"),
+  pat_fungal        = ru_or("pat_fungal"),
   CT_count_pos = "Устройств CT на пациента, n",
   LPS_count_pos = "Устройств LPS на пациента, n",
   devices_total_pos = "Всего устройств на пациента, n",
@@ -586,20 +708,28 @@ lbl_top <- list(
   outcome = ru_or("outcome")
 )
 
-type_top  <- list(vasopressors_used ~ "dichotomous")
-value_top <- list(vasopressors_used ~ "Да")
+type_top  <- list(
+  vasopressors_used ~ "dichotomous",
+  RRT_required ~ "dichotomous",
+  MV_required ~ "dichotomous"
+)
 
-if (isTRUE(show_antibiotics) && "antibiotics_started" %in% names(pt)) {
+value_top <- list(
+  vasopressors_used ~ "Да",
+  RRT_required ~ "Да",
+  MV_required ~ "Да"
+)
+
+if (isTRUE(show_antibiotics) && "antibiotics_started" %in% names(pt_top)) {
   vars_top <- c(vars_top, "antibiotics_started")
   lbl_top$antibiotics_started <- "Антибиотики начаты (дата заполнена)"
   type_top  <- c(type_top,  list(antibiotics_started ~ "dichotomous"))
   value_top <- c(value_top, list(antibiotics_started ~ "Да"))
 }
 
-# label только для реально выбранных переменных
 lbl_top <- lbl_top[names(lbl_top) %in% vars_top]
 
-tbl_top <- pt %>%
+tbl_top <- pt_top %>%
   select(any_of(vars_top)) %>%
   tbl_summary(
     type = type_top,
@@ -612,35 +742,74 @@ tbl_top <- pt %>%
     missing = "no"
   )
 
-# ---------------- нижняя часть (единицы в названии, без *_unit) ----------------
-u_lactate <- unit_mode(pt$lactate_unit)
-u_creat   <- unit_mode(pt$creatinine_unit)
-u_albumin <- unit_mode(pt$albumin_unit)
-u_crp     <- unit_mode(pt$C_react_protein_unit)
-u_pct     <- unit_mode(pt$procalcitonin_unit)
-u_ddimer  <- unit_mode(pt$D_dimer_unit)
-u_fibr    <- unit_mode(pt$fibrinogen_unit)
+# ------------ показания к гемосорбции (diag_wide уже загружен в ETL) ------------
+tbl_indications <- NULL
+diag_n <- NA_integer_
+
+if (!is.null(diag_wide) && "pat_record_id" %in% names(diag_wide)) {
+  diag_wide2 <- diag_wide %>%
+    mutate(pat_record_id = as.character(pat_record_id)) %>%
+    semi_join(pt_top %>% select(pat_record_id), by = "pat_record_id")
+
+  diag_n <- nrow(diag_wide2)
+  diag_cols <- setdiff(names(diag_wide2), "pat_record_id")
+
+  count_yes <- function(v) {
+    v <- as.character(v)
+    v <- str_to_lower(str_squish(v))
+    sum(v %in% c("1","да","yes","true"), na.rm = TRUE)
+  }
+
+  if (diag_n > 0 && length(diag_cols) > 0) {
+    dx_order <- diag_wide2 %>%
+      summarise(across(all_of(diag_cols), count_yes)) %>%
+      pivot_longer(everything(), names_to = "dx", values_to = "n_yes") %>%
+      arrange(desc(n_yes), dx) %>%
+      pull(dx)
+
+    diag_tbl <- diag_wide2 %>%
+      mutate(across(all_of(dx_order), ~ factor(
+        if_else(as.character(.) %in% c("1","Да","да","TRUE","true"), "Да", "Нет"),
+        levels = c("Да","Нет")
+      ))) %>%
+      select(all_of(dx_order))
+
+    tbl_indications <- diag_tbl %>%
+      tbl_summary(
+        type = everything() ~ "dichotomous",
+        value = everything() ~ "Да",
+        statistic = all_categorical() ~ "{p}% ({n})",
+        label = rlang::set_names(as.list(dx_order), dx_order),
+        missing = "no"
+      )
+  }
+}
+
+# ---------------- нижняя часть (колонки по timepoint) ----------------
+pt_bottom <- patients_tidy %>%
+  filter(timepoint %in% tps_bottom) %>%
+  mutate(timepoint = factor(timepoint, levels = tps_bottom)) %>%
+  distinct(pat_record_id, timepoint, .keep_all = TRUE)
+
+u_lactate <- unit_mode(pt_bottom$lactate_unit)
+u_creat   <- unit_mode(pt_bottom$creatinine_unit)
+u_albumin <- unit_mode(pt_bottom$albumin_unit)
+u_crp     <- unit_mode(pt_bottom$C_react_protein_unit)
+u_pct     <- unit_mode(pt_bottom$procalcitonin_unit)
+u_ddimer  <- unit_mode(pt_bottom$D_dimer_unit)
+u_fibr    <- unit_mode(pt_bottom$fibrinogen_unit)
 
 vars_bottom <- c(
-  "SOFA",
-  "VIS2020_pos",
-  "PaFiO2",
-  "lactate",
-  "creatinine",
-  "albumin",
-  "C_react_protein",
-  "procalcitonin",
-  "D_dimer",
-  "fibrinogen",
-  "leucocytes","lymphocytes","neutrophils",
-  "NLR",
-  "thrombocytes",
-  "pat_bacteremia","pat_gram_negative","pat_gram_positive","pat_fungal"
+  "SOFA","VIS2020","PaFiO2",
+  "lactate","creatinine","albumin","C_react_protein",
+  "procalcitonin","D_dimer","fibrinogen",
+  "leucocytes","lymphocytes","neutrophils","NLR",
+  "thrombocytes"
 )
 
 lbl_bottom <- list(
   SOFA = ru_or("SOFA"),
-  VIS2020_pos = ru_or("VIS2020"),
+  VIS2020 = ru_or("VIS2020"),
   PaFiO2 = ru_or("PaFiO2"),
   lactate = lab_u(ru_or("lactate"), u_lactate),
   creatinine = lab_u(ru_or("creatinine"), u_creat),
@@ -653,88 +822,82 @@ lbl_bottom <- list(
   lymphocytes = ru_or("lymphocytes"),
   neutrophils = ru_or("neutrophils"),
   NLR = "NLR (нейтрофилы/лимфоциты)",
-  thrombocytes = ru_or("thrombocytes"),
-  pat_bacteremia = ru_or("pat_bacteremia"),
-  pat_gram_negative = ru_or("pat_gram_negative"),
-  pat_gram_positive = ru_or("pat_gram_positive"),
-  pat_fungal = ru_or("pat_fungal")
+  thrombocytes = ru_or("thrombocytes")
 )
-
 lbl_bottom <- lbl_bottom[names(lbl_bottom) %in% vars_bottom]
 
-tbl_bottom <- pt %>%
-  select(any_of(vars_bottom)) %>%
+tbl_bottom <- pt_bottom %>%
+  select(timepoint, any_of(vars_bottom)) %>%
   tbl_summary(
-    statistic = list(
-      all_continuous() ~ "{median} ({p25}, {p75})",
-      all_categorical() ~ "{p}% ({n})",
-      VIS2020_pos ~ "{mean}"
-    ),
-    digits = list(
-      NLR ~ 2
-    ),
+    by = timepoint,
+    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})"),
+    digits = list(NLR ~ 2),
     label = lbl_bottom,
     missing = "no"
   )
 
-tbl_m12h_0h <- tbl_stack(
-  list(tbl_top, tbl_bottom),
-  group_header = c(
-    "Общие характеристики",
-    "Параметры: точка -12–0 часов"
-  )
-) %>%
-  modify_caption("**2Reg: сводная таблица по пациентам, timepoint m12h_0h**") %>%
+# ---------------- итог: верх (+показания) + низ ----------------
+tbls <- list(tbl_top)
+hdrs <- c("Общие характеристики")
+
+if (!is.null(tbl_indications)) {
+  tbls <- c(tbls, list(tbl_indications))
+  hdrs <- c(hdrs, sprintf("Показания к гемосорбции (n=%d)", diag_n))
+}
+
+tbls <- c(tbls, list(tbl_bottom))
+hdrs <- c(hdrs, "Параметры по временным точкам")
+
+tbl_pat <- tbl_stack(tbls, group_header = hdrs) %>%
+  modify_table_styling(rows = row_type == "label", columns = label, text_format = "bold") %>%
+  modify_table_styling(rows = row_type %in% c("group_header", "group"), columns = label, text_format = "bold") %>%
+  modify_caption("**2Reg: сводная таблица по пациентам**") %>%
   modify_header(label = "**Параметр**")
 
-tbl_m12h_0h
-
+tbl_pat
 ```
 
 ```{r}
 
 #| label: ha_gtsummary_compact
 #| cache: true
-#| echo: true
+#| echo: false
 
+library(dplyr)
+library(stringr)
 library(gtsummary)
 
-sq <- function(x) stringr::str_squish(as.character(x))
-norm0 <- function(x){
-  x <- stringr::str_to_lower(sq(x))
-  x <- stringr::str_replace_all(x, "\u00A0", " ")
-  stringr::str_squish(x)
+`%||%` <- function(x, y) {
+  if (!is.null(x) && length(x) && !is.na(x) && as.character(x) != "") x else y
 }
 
-dict_ha <- readxl::read_excel(dict_file, col_types = "text") %>%
-  dplyr::transmute(dataset = sq(dataset), short = sq(short), ru = sq(ru)) %>%
-  dplyr::filter(tolower(dataset) == "ha_tidy", !is.na(short), short != "") %>%
-  dplyr::group_by(short) %>%
-  dplyr::summarise(ru = dplyr::first(stats::na.omit(ru)), .groups = "drop")
+sq <- function(x) str_squish(as.character(x))
+norm0 <- function(x){
+  x <- str_to_lower(sq(x))
+  x <- str_replace_all(x, "\u00A0", " ")
+  str_squish(x)
+}
 
-ha_label_map <- tibble::deframe(dict_ha)
+# используем dict_ha, который уже создан в ETL (без повторного read_excel)
+ha_label_map <- tibble::deframe(dict_ha)  # names = short, values = ru
 label_list <- rlang::set_names(as.list(ha_label_map), names(ha_label_map))
 
 ha_proc <- HA_tidy %>%
-  dplyr::mutate(
-    HA_duration       = as.numeric(HA_duration),
-    HA_avg_blood_flow = as.numeric(HA_avg_blood_flow),
-
-    HA_anticoagulation_cat = dplyr::case_when(
+  mutate(
+    HA_anticoagulation_cat = case_when(
       HA_anticoagulation == "Цитрат"  ~ "Цитрат",
       HA_anticoagulation == "Гепарин" ~ "Гепарин",
       HA_anticoagulation == "Другой" &
-        norm0(dplyr::coalesce(HA_anticoagulation_other, "")) %in% c("без антикоагуляции") ~
-        "Без антикоагуляции",
+        norm0(coalesce(HA_anticoagulation_other, "")) %in% c("без антикоагуляции") ~ "Без антикоагуляции",
       HA_anticoagulation == "Другой" ~ "Другой",
       TRUE ~ "Другой"
     ),
 
-    other_norm = norm0(dplyr::coalesce(HA_other_methods, "")),
-    has_rrt  = stringr::str_detect(other_norm, "гемодиафильтрац|гемодиализ|гемофильтрац"),
-    has_ecmo = stringr::str_detect(other_norm, "экмо"),
+    other_norm = norm0(coalesce(HA_other_methods, "")),
+    has_rrt  = str_detect(other_norm, "гемодиафильтрац|гемодиализ|гемофильтрац"),
+    has_ecmo = str_detect(other_norm, "экмо"),
 
-    HA_other_methods_cat = dplyr::case_when(
+    HA_other_methods_cat = case_when(
       other_norm == "" ~ "Не применялась",
       other_norm %in% c("не применялась", "не применялось", "нет", "не было", "-", "—") ~ "Не применялась",
       has_rrt ~ "ЗПТ",
@@ -750,14 +913,15 @@ ha_proc <- HA_tidy %>%
       !(is.na(x) | x %in% c("", "нет", "не было", "-", "—"))
     }, "Да", "Нет")
   ) %>%
-  dplyr::select(-other_norm, -has_rrt, -has_ecmo)
+  select(-other_norm, -has_rrt, -has_ecmo)
 
+# переменные, которые не имеет смысла показывать в разрезе rrt_grp (оставляем только All)
 no_strat_vars <- c("HA_other_methods_cat")
 
 tbl <- ha_proc %>%
-  dplyr::select(
+  select(
     rrt_grp,
-    HA_other_methods_cat,   # перенесли вверх
+    HA_other_methods_cat,   # наверху
     HA_cartrige_type,
     HA_duration,
     HA_avg_blood_flow,
@@ -766,11 +930,11 @@ tbl <- ha_proc %>%
   ) %>%
   tbl_summary(
     by = rrt_grp,
-   statistic = list(
-  all_continuous() ~ "{median} ({p25}, {p75})",
-  all_categorical() ~ "{p}% ({n})"
-),
-    missing = "no",                 # убираем строку "не указано" для длительности и др.
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{p}% ({n})"
+    ),
+    missing = "no",
     sort = all_categorical() ~ "frequency",
     label = c(
       label_list,
@@ -789,16 +953,229 @@ tbl <- ha_proc %>%
   ) %>%
   modify_table_body(
     ~ .x %>%
-      dplyr::mutate(
-        stat_1 = dplyr::if_else(variable %in% no_strat_vars, "", stat_1),
-        stat_2 = dplyr::if_else(variable %in% no_strat_vars, "", stat_2)
+      mutate(
+        stat_1 = if_else(variable %in% no_strat_vars, "", stat_1),
+        stat_2 = if_else(variable %in% no_strat_vars, "", stat_2)
       )
   ) %>%
   modify_caption("**2Reg: сводная таблица по сорбциям**") %>%
   bold_labels()
 
-
-  
 tbl
+```
 
+```{r}
+#| label: gtsummary_m12h_0h_48h_72h
+#| cache: true
+#| echo: false
+
+tp_keep <- c("m12h_0h", "48h_72h")
+
+vars <- c(
+  "SOFA","PaFiO2","lactate","creatinine","albumin","C_react_protein",
+  "procalcitonin","D_dimer","fibrinogen","leucocytes","lymphocytes",
+  "neutrophils","thrombocytes","VIS2020"
+)
+vars <- intersect(vars, names(patients_tidy))
+
+patients_paired <-
+  patients_tidy %>%
+  semi_join(ids_lps_72h, by = "pat_record_id") %>%
+  filter(timepoint %in% tp_keep) %>%
+  mutate(timepoint = factor(timepoint, levels = tp_keep)) %>%
+  filter(.by = pat_record_id, n_distinct(timepoint) == 2) %>%
+  select(pat_record_id, timepoint, any_of(vars))
+
+tbl <-
+  patients_paired %>%
+  tbl_summary(
+    by = timepoint,
+    include = -pat_record_id,
+    statistic = all_continuous() ~ "{median} ({p25}, {p75})",
+    missing = "ifany"
+  ) %>%
+  add_p(
+    test  = all_continuous() ~ "paired.t.test",
+    group = pat_record_id
+  ) %>%
+  bold_labels()
+
+tbl
+```
+
+```{r}
+
+#| label: plots_m12h_0h_48h_72h
+#| cache: true
+#| warning: false
+#| message: false
+
+# Ожидается, что vars, tp_keep и patients_paired уже существуют
+vars_plot <- vars
+
+plot_long <- patients_paired %>%
+  select(pat_record_id, timepoint, any_of(vars_plot)) %>%
+  pivot_longer(
+    cols = -c(pat_record_id, timepoint),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(
+    timepoint = factor(timepoint, levels = tp_keep),
+    variable  = factor(variable, levels = vars_plot)
+  )
+
+q <- function(x, p) {
+  if (all(is.na(x))) NA_real_
+  else as.numeric(quantile(x, p, na.rm = TRUE, names = FALSE))
+}
+
+stats_data <- plot_long %>%
+  group_by(variable, timepoint) %>%
+  summarise(
+    n   = sum(!is.na(value)),
+    Me  = if (all(is.na(value))) NA_real_ else median(value, na.rm = TRUE),
+    Q1  = q(value, 0.25),
+    Q3  = q(value, 0.75),
+    P05 = q(value, 0.05),
+    P95 = q(value, 0.95),
+    .groups = "drop"
+  )
+
+make_plot <- function(var_name) {
+  df_stat <- stats_data %>% filter(variable == var_name)
+  df_raw  <- plot_long  %>% filter(variable == var_name) %>% drop_na(value)
+
+  # линии только для complete pairs по этой переменной
+  df_line <- df_raw %>%
+    group_by(pat_record_id) %>%
+    filter(n_distinct(timepoint) == 2, n() == 2) %>%
+    ungroup()
+
+  ggplot() +
+    geom_boxplot(
+      data = df_stat,
+      aes(
+        x = timepoint,
+        ymin = P05, ymax = P95,
+        lower = Q1, middle = Me, upper = Q3
+      ),
+      stat = "identity",
+      outlier.shape = NA,
+      alpha = 0.4
+    ) +
+    geom_line(
+      data = df_line,
+      aes(x = timepoint, y = value, group = pat_record_id),
+      alpha = 0.25
+    ) +
+    geom_point(
+      data = df_raw,
+      aes(x = timepoint, y = value),
+      position = position_jitter(width = 0.08, height = 0),
+      size = 0.9,
+      alpha = 0.35
+    ) +
+    labs(title = as.character(var_name), x = NULL, y = NULL) +
+    theme_bw()
+}
+
+plots_list <- vars_plot %>%
+  set_names() %>%
+  purrr::map(make_plot)
+
+# Показать все графики в отчёте
+purrr::walk(plots_list, print)
+
+# (опционально) сохранить в PNG
+# dir.create("plots_m12h_0h_48h_72h", showWarnings = FALSE)
+# 
+# purrr::iwalk(
+#   plots_list,
+#   ~ ggsave(
+#     filename = file.path(
+#       "plots_m12h_0h_48h_72h",
+#       paste0(stringr::str_remove_all(.y, "[^[:alnum:]_]+"), ".png")
+#     ),
+#     plot = .x,
+#     width = 7, height = 4, dpi = 300
+#   )
+# )
+```
+
+```{r}
+
+#| label: facet_wrap_plots_m12h_0h_48h_72h
+#| cache: true
+#| warning: false
+#| message: false
+
+# Ожидается, что vars, tp_keep и patients_paired уже существуют
+vars_plot <- vars
+
+plot_long <- patients_paired %>%
+  select(pat_record_id, timepoint, any_of(vars_plot)) %>%
+  pivot_longer(
+    cols = -c(pat_record_id, timepoint),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(
+    timepoint = factor(timepoint, levels = tp_keep),
+    variable  = factor(variable, levels = vars_plot)
+  )
+
+q <- function(x, p) {
+  if (all(is.na(x))) NA_real_
+  else as.numeric(quantile(x, p, na.rm = TRUE, names = FALSE))
+}
+
+stats_data <- plot_long %>%
+  group_by(variable, timepoint) %>%
+  summarise(
+    n   = sum(!is.na(value)),
+    Me  = if (all(is.na(value))) NA_real_ else median(value, na.rm = TRUE),
+    Q1  = q(value, 0.25),
+    Q3  = q(value, 0.75),
+    P05 = q(value, 0.05),
+    P95 = q(value, 0.95),
+    .groups = "drop"
+  )
+
+df_raw <- plot_long %>% drop_na(value)
+
+df_line <- df_raw %>%
+  group_by(variable, pat_record_id) %>%
+  filter(n_distinct(timepoint) == 2, n() == 2) %>%
+  ungroup()
+
+p <- ggplot() +
+  geom_boxplot(
+    data = stats_data,
+    aes(
+      x = timepoint,
+      ymin = P05, ymax = P95,
+      lower = Q1, middle = Me, upper = Q3
+    ),
+    stat = "identity",
+    outlier.shape = NA,
+    alpha = 0.4
+  ) +
+  geom_line(
+    data = df_line,
+    aes(x = timepoint, y = value, group = interaction(variable, pat_record_id)),
+    alpha = 0.25
+  ) +
+  geom_point(
+    data = df_raw,
+    aes(x = timepoint, y = value),
+    position = position_jitter(width = 0.08, height = 0),
+    size = 0.9,
+    alpha = 0.35
+  ) +
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(x = NULL, y = NULL) +
+  theme_bw()
+
+p
 ```
