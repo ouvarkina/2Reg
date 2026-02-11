@@ -47,7 +47,7 @@ fmt_int <- function(x) formatC(as.integer(round(x)), format = "f", digits = 0)
 fmt_1   <- function(x) formatC(x, format = "f", digits = 1)
 fmt_2   <- function(x) formatC(x, format = "f", digits = 2)
 
-save_xlsx <- FALSE
+save_xlsx <- TRUE
 ```
 
 ```{r}
@@ -998,10 +998,13 @@ tbl <-
     test  = all_continuous() ~ "paired.t.test",
     group = pat_record_id
   ) %>%
+  modify_caption("Парные сравнения -12-0 и 48-72 часов, только LPS") %>%
   bold_labels()
 
 tbl
 ```
+
+Графики (только LPS)
 
 ```{r}
 
