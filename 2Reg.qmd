@@ -863,10 +863,6 @@ tbl_pat
 #| cache: true
 #| echo: false
 
-library(dplyr)
-library(stringr)
-library(gtsummary)
-
 `%||%` <- function(x, y) {
   if (!is.null(x) && length(x) && !is.na(x) && as.character(x) != "") x else y
 }
@@ -983,7 +979,7 @@ patients_paired <-
   semi_join(ids_lps_72h, by = "pat_record_id") %>%
   filter(timepoint %in% tp_keep) %>%
   mutate(timepoint = factor(timepoint, levels = tp_keep)) %>%
-  filter(.by = pat_record_id, n_distinct(timepoint) == 2) %>%
+  # filter(.by = pat_record_id, n_distinct(timepoint) == 2) %>%
   select(pat_record_id, timepoint, any_of(vars))
 
 tbl <-
@@ -994,9 +990,15 @@ tbl <-
     statistic = all_continuous() ~ "{median} ({p25}, {p75})",
     missing = "ifany"
   ) %>%
-  add_p(
+  
+  # add_p(
+  #   test  = all_continuous() ~ "paired.t.test",
+  #   group = pat_record_id
+  # ) %>%
+  add_difference(
     test  = all_continuous() ~ "paired.t.test",
     group = pat_record_id
+
   ) %>%
   modify_caption("Парные сравнения -12-0 и 48-72 часов, только LPS") %>%
   bold_labels()
@@ -1012,9 +1014,14 @@ tbl
 #| cache: true
 #| warning: false
 #| message: false
+#| fig-width: 7
+#| fig-height: 4
 
 # Ожидается, что vars, tp_keep и patients_paired уже существуют
 vars_plot <- vars
+
+# Логарифмируем ось Y только для выбранных переменных
+vars_log_Y <- c("lactate", "D_dimer", "lymphocytes", "procalcitonin")
 
 plot_long <- patients_paired %>%
   select(pat_record_id, timepoint, any_of(vars_plot)) %>%
@@ -1049,13 +1056,22 @@ make_plot <- function(var_name) {
   df_stat <- stats_data %>% filter(variable == var_name)
   df_raw  <- plot_long  %>% filter(variable == var_name) %>% drop_na(value)
 
-  # линии только для complete pairs по этой переменной
+  # Для лог-шкалы убираем нули/отрицательные (иначе -Inf)
+  if (as.character(var_name) %in% vars_log_Y) {
+    df_raw  <- df_raw  %>% filter(value > 0)
+    df_stat <- df_stat %>% mutate(
+      # ничего не пересчитываем здесь, просто оставляем как есть;
+      # если хотите, можно пересчитать stats_data на value>0, но это уже усложнение
+      n = n
+    )
+  }
+
   df_line <- df_raw %>%
     group_by(pat_record_id) %>%
     filter(n_distinct(timepoint) == 2, n() == 2) %>%
     ungroup()
 
-  ggplot() +
+  p <- ggplot() +
     geom_boxplot(
       data = df_stat,
       aes(
@@ -1075,12 +1091,19 @@ make_plot <- function(var_name) {
     geom_point(
       data = df_raw,
       aes(x = timepoint, y = value),
-      position = position_jitter(width = 0.08, height = 0),
+      position = position_jitter(width = 0.008, height = 0),
       size = 0.9,
       alpha = 0.35
     ) +
     labs(title = as.character(var_name), x = NULL, y = NULL) +
     theme_bw()
+
+  # Лог-шкала только для выбранных переменных
+  if (as.character(var_name) %in% vars_log_Y) {
+    p <- p + scale_y_log10(expand = expansion(mult = c(0.1, 0.1)))
+  }
+
+  p
 }
 
 plots_list <- vars_plot %>%
@@ -1108,13 +1131,18 @@ purrr::walk(plots_list, print)
 
 ```{r}
 
-#| label: facet_wrap_plots_m12h_0h_48h_72h
+#| label: plots_m12h_0h_48h_72h
 #| cache: true
 #| warning: false
 #| message: false
+#| fig-width: 12
+#| fig-height: 8
+
+library(ggh4x)   # install.packages("ggh4x") # если не установлен
 
 # Ожидается, что vars, tp_keep и patients_paired уже существуют
 vars_plot <- vars
+vars_log_Y <- c("lactate", "D_dimer", "lymphocytes", "procalcitonin")
 
 plot_long <- patients_paired %>%
   select(pat_record_id, timepoint, any_of(vars_plot)) %>%
@@ -1125,58 +1153,47 @@ plot_long <- patients_paired %>%
   ) %>%
   mutate(
     timepoint = factor(timepoint, levels = tp_keep),
-    variable  = factor(variable, levels = vars_plot)
-  )
+    variable_chr = as.character(variable),
+    is_log = variable_chr %in% vars_log_Y,
 
-q <- function(x, p) {
-  if (all(is.na(x))) NA_real_
-  else as.numeric(quantile(x, p, na.rm = TRUE, names = FALSE))
-}
+    # для лог-переменных убираем 0 и отрицательные (иначе log10 даст -Inf и предупреждения)
+    value = if_else(is_log & !is.na(value) & value <= 0, NA_real_, as.numeric(value)),
 
-stats_data <- plot_long %>%
-  group_by(variable, timepoint) %>%
-  summarise(
-    n   = sum(!is.na(value)),
-    Me  = if (all(is.na(value))) NA_real_ else median(value, na.rm = TRUE),
-    Q1  = q(value, 0.25),
-    Q3  = q(value, 0.75),
-    P05 = q(value, 0.05),
-    P95 = q(value, 0.95),
-    .groups = "drop"
-  )
+    # подпись панели (помечаем лог-переменные)
+    variable_facet = if_else(is_log,
+                             paste0(variable_chr, " (log10-axis)"),
+                             variable_chr),
+    variable_facet = factor(
+      variable_facet,
+      levels = if_else(vars_plot %in% vars_log_Y,
+                       paste0(vars_plot, " (log10-axis)"),
+                       vars_plot)
+    )
+  ) %>%
+  drop_na(value)
 
-df_raw <- plot_long %>% drop_na(value)
-
-df_line <- df_raw %>%
-  group_by(variable, pat_record_id) %>%
+# линии только для complete pairs по переменной
+plot_lines <- plot_long %>%
+  group_by(variable_facet, pat_record_id) %>%
   filter(n_distinct(timepoint) == 2, n() == 2) %>%
   ungroup()
 
-p <- ggplot() +
-  geom_boxplot(
-    data = stats_data,
-    aes(
-      x = timepoint,
-      ymin = P05, ymax = P95,
-      lower = Q1, middle = Me, upper = Q3
-    ),
-    stat = "identity",
-    outlier.shape = NA,
-    alpha = 0.4
+p <- ggplot(plot_long, aes(x = timepoint, y = value)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.35) +
+  geom_line(data = plot_lines, aes(group = pat_record_id), alpha = 0.20) +
+  geom_point(position = position_jitter(width = 0.08, height = 0),
+             size = 0.9, alpha = 0.35) +
+  facet_wrap(~ variable_facet, scales = "free_y", ncol = 4) +
+  # применяем log10-шкалу только к нужным панелям
+  ggh4x::facetted_pos_scales(
+    y = list(
+      variable_facet == "lactate (log10-axis)"       ~ scale_y_log10(expand = expansion(mult = c(0.1, 0.1))),
+      variable_facet == "D_dimer (log10-axis)"       ~ scale_y_log10(expand = expansion(mult = c(0.1, 0.1))),
+      variable_facet == "lymphocytes (log10-axis)"   ~ scale_y_log10(expand = expansion(mult = c(0.1, 0.1))),
+      variable_facet == "procalcitonin (log10-axis)" ~ scale_y_log10(expand = expansion(mult = c(0.1, 0.1))),
+      TRUE ~ scale_y_continuous(expand = expansion(mult = c(0.05, 0.1)))
+    )
   ) +
-  geom_line(
-    data = df_line,
-    aes(x = timepoint, y = value, group = interaction(variable, pat_record_id)),
-    alpha = 0.25
-  ) +
-  geom_point(
-    data = df_raw,
-    aes(x = timepoint, y = value),
-    position = position_jitter(width = 0.08, height = 0),
-    size = 0.9,
-    alpha = 0.35
-  ) +
-  facet_wrap(~ variable, scales = "free_y") +
   labs(x = NULL, y = NULL) +
   theme_bw()
 
