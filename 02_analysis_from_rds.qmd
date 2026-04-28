@@ -39,6 +39,8 @@ suppressPackageStartupMessages({
   library(officer)
   library(ggplot2)
   library(rlang)
+  library(survival)
+  library(survminer)
 })
 
 DATA_DIR    <- "data"
@@ -84,6 +86,22 @@ if (is.na(diag_file)) diag_file <- NA_character_
 patients_tidy <- readRDS(patients_rds)
 HA_tidy       <- readRDS(ha_rds)
 
+# Убираем переведенных из других ОРИТ, TRUE/FALSE
+exclude_other_icu_transfer <- FALSE
+
+if (exclude_other_icu_transfer) {
+  ids_exclude <- patients_tidy %>%
+    distinct(pat_record_id, from_other_ICU_transfer) %>%
+    filter(from_other_ICU_transfer == "Да") %>%
+    pull(pat_record_id)
+
+  patients_tidy <- patients_tidy %>%
+    filter(!pat_record_id %in% ids_exclude)
+
+  HA_tidy <- HA_tidy %>%
+    filter(!pat_record_id %in% ids_exclude)
+}
+
 dict <- read_excel(dict_file, col_types = "text") %>%
   mutate(across(everything(), as.character)) %>%
   transmute(
@@ -124,6 +142,29 @@ norm_txt <- function(x) {
   x <- stringr::str_squish(x)
   x[x == ""] <- NA_character_
   x
+}
+
+pat_gram_stain_for_tables <- function(x) {
+  x <- dplyr::case_when(
+    is.na(x) ~ NA_character_,
+    as.character(x) == "mix"   ~ "Смешанные",
+    as.character(x) == "gram+" ~ "Грамположительные",
+    as.character(x) == "gram-" ~ "Грамотрицательные",
+    as.character(x) == "neg"   ~ "Отрицательный посев",
+    as.character(x) == "N/A"   ~ "Посев не проводился",
+    TRUE ~ NA_character_
+  )
+
+  factor(
+    x,
+    levels = c(
+      "Смешанные",
+      "Грамположительные",
+      "Грамотрицательные",
+      "Отрицательный посев",
+      "Посев не проводился"
+    )
+  )
 }
 ```
 
@@ -238,12 +279,17 @@ pt_top <- pt_top %>%
     outcome_logit = factor(outcome_logit, levels = c(0, 1)))
 
 # ---------------- верхняя часть  ----------------
+pt_top <- pt_top %>%
+  mutate(
+    pat_gram_stain = pat_gram_stain_for_tables(pat_gram_stain)
+  )
+
 vars_top <- c(
   "age_yr","sex","BMI","ICU_6_month_history","from_other_ICU_transfer",
   "icu_to_HA1_hours",
   "vasopressors_used","RRT_required","MV_required",
   "charlson_index",
-  "pat_bacteremia","pat_gram_negative","pat_gram_positive","pat_fungal",
+  "pat_bacteremia","pat_gram_stain","pat_fungal",
   "CT_count_pos","LPS_count_pos","devices_total_pos",
   "HA_efficency_CGI_E","outcome"
 )
@@ -259,10 +305,9 @@ lbl_top <- list(
   RRT_required = "Потребность в ЗПТ",
   MV_required  = "Потребность в ИВЛ",
   charlson_index = ru_or("charlson_index"),
-  pat_bacteremia    = ru_or("pat_bacteremia"),
-  pat_gram_negative = ru_or("pat_gram_negative"),
-  pat_gram_positive = ru_or("pat_gram_positive"),
-  pat_fungal        = ru_or("pat_fungal"),
+  pat_bacteremia = ru_or("pat_bacteremia"),
+  pat_gram_stain = "Бактериальная флора по Граму",
+  pat_fungal = ru_or("pat_fungal"),
   CT_count_pos = "Устройств CT на пациента, n",
   LPS_count_pos = "Устройств LPS на пациента, n",
   devices_total_pos = "Всего устройств на пациента, n",
@@ -529,7 +574,7 @@ cat("unique fibrinogen =", n_distinct(dbg2$fibrinogen), "\n")
 print(dbg2 %>% arrange(PaFiO2))
 
 # 4) Пересчитать тестом (он покажет оценку и p-value, и использованное n)
-print(cor.test(dbg2$PaFiO2, dbg2$fibrinogen, method = "kendall", exact = FALSE))
+# print(cor.test(dbg2$PaFiO2, dbg2$fibrinogen, method = "kendall", exact = # FALSE))
 
 # 5) Визуальная проверка
 ggplot(dbg2, aes(PaFiO2, fibrinogen)) +
@@ -946,7 +991,7 @@ openxlsx::write.xlsx(
 
 # Парные сравнения (-12-0) - (48-72)ч
 
-## Wilcox по выборке
+## Wilcox по выборке (только LPS)
 
 ```{r}
 
@@ -1333,6 +1378,267 @@ plots_list <- vars_plot %>%
 purrr::walk(plots_list, print)
 ```
 
+## SOFA\>=4
+
+```{r}
+
+#| label: plot_SOFA_ge4_m12h_0h
+#| cache: true
+#| warning: false
+#| message: false
+#| fig-width: 7
+#| fig-height: 4
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+tp_keep <- c("m12h_0h", "48h_72h")
+
+tp_labels <- c(
+  m12h_0h   = "-12-0 часов",
+  `48h_72h` = "48-72 часа"
+)
+
+q <- function(x, p) {
+  if (all(is.na(x))) NA_real_
+  else as.numeric(quantile(x, p, na.rm = TRUE, names = FALSE))
+}
+
+# 1) Берем только LPS и только реальные пары
+# 2) Оставляем только пациентов с SOFA >= 4 в точке m12h_0h
+sofa_ge4_df <- patients_analysis_clin_window %>%
+  filter(first_sorption_type == "LPS") %>%
+  select(pat_record_id, timepoint, clin_assess_dt, SOFA) %>%
+  distinct(pat_record_id, timepoint, .keep_all = TRUE) %>%
+  filter(timepoint %in% tp_keep) %>%
+  group_by(pat_record_id) %>%
+  filter(n_distinct(timepoint) == 2) %>%
+  ungroup() %>%
+  group_by(pat_record_id) %>%
+  mutate(
+    SOFA_m12 = SOFA[match("m12h_0h", timepoint)]
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(SOFA_m12), SOFA_m12 >= 4)
+
+# для графика требуем ненулевые/не-NA значения SOFA в обеих точках
+sofa_ge4_plot <- sofa_ge4_df %>%
+  filter(!is.na(SOFA)) %>%
+  group_by(pat_record_id) %>%
+  filter(n_distinct(timepoint) == 2, n() == 2) %>%
+  ungroup() %>%
+  mutate(timepoint = factor(timepoint, levels = tp_keep))
+
+# статистики для boxplot
+sofa_ge4_stat <- sofa_ge4_plot %>%
+  group_by(timepoint) %>%
+  summarise(
+    n   = sum(!is.na(SOFA)),
+    Me  = median(SOFA, na.rm = TRUE),
+    Q1  = q(SOFA, 0.25),
+    Q3  = q(SOFA, 0.75),
+    P05 = q(SOFA, 0.05),
+    P95 = q(SOFA, 0.95),
+    .groups = "drop"
+  )
+
+# p-value парного t-test
+sofa_ge4_wide <- sofa_ge4_plot %>%
+  select(pat_record_id, timepoint, SOFA) %>%
+  pivot_wider(names_from = timepoint, values_from = SOFA)
+
+n_pairs <- nrow(sofa_ge4_wide)
+
+p_txt <- paste0("paired t-test p = NA (too few pairs), n = ", n_pairs)
+if (n_pairs >= 2 &&
+    all(tp_keep %in% names(sofa_ge4_wide)) &&
+    sum(!is.na(sofa_ge4_wide[[tp_keep[1]]]) & !is.na(sofa_ge4_wide[[tp_keep[2]]])) >= 2) {
+  pval <- stats::t.test(
+    sofa_ge4_wide[[tp_keep[1]]],
+    sofa_ge4_wide[[tp_keep[2]]],
+    paired = TRUE
+  )$p.value
+  p_txt <- paste0(
+    "paired t-test p = ",
+    format.pval(pval, digits = 2, eps = 1e-3),
+    ", n = ",
+    n_pairs
+  )
+}
+
+ggplot() +
+  geom_boxplot(
+    data = sofa_ge4_stat,
+    aes(
+      x = timepoint,
+      ymin = P05, ymax = P95,
+      lower = Q1, middle = Me, upper = Q3,
+      fill = timepoint
+    ),
+    stat = "identity",
+    outlier.shape = NA,
+    alpha = 0.55
+  ) +
+  geom_line(
+    data = sofa_ge4_plot,
+    aes(x = timepoint, y = SOFA, group = pat_record_id),
+    alpha = 0.25
+  ) +
+  geom_point(
+    data = sofa_ge4_plot,
+    aes(x = timepoint, y = SOFA),
+    position = position_jitter(width = 0.008, height = 0),
+    size = 0.9,
+    alpha = 0.35
+  ) +
+  scale_x_discrete(labels = tp_labels) +
+  labs(
+    title = "SOFA ≥ 4 в точке -12–0 часов",
+    subtitle = p_txt,
+    x = NULL,
+    y = NULL
+  ) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+```
+
+# Kaplan-Meier
+
+```{r}
+
+#| label: kaplan_meier_HA_24h
+#| cache: false
+#| echo: false
+
+df_km <- patients_tidy %>%
+  distinct(pat_record_id, .keep_all = TRUE) %>%
+  filter(
+    !is.na(icu_to_HA1_hours),
+    !is.na(ICU_in_dt),
+    !is.na(ICU_out_or_death_dt),
+    !is.na(outcome)
+  ) %>%
+  mutate(
+    time_days = as.numeric(ICU_out_or_death_dt - ICU_in_dt, units = "days"),
+    event = if_else(outcome == "Умер", 1, 0),
+    early_start = if_else(icu_to_HA1_hours < 24, "Раннее (<24ч)", "Позднее (≥24ч)")
+  ) %>%
+  filter(!is.na(time_days), time_days >= 0)
+
+# 30-дневное административное цензурирование
+df_km_30 <- df_km %>%
+  mutate(
+    time_30 = pmin(time_days, 30),
+    event_30 = if_else(time_days <= 30 & event == 1, 1, 0)
+  )
+
+fit_30 <- survfit(Surv(time_30, event_30) ~ early_start, data = df_km_30)
+
+plot(
+  fit_30,
+  col = 1:2,
+  lwd = 2,
+  xlab = "Дни с момента поступления в ОРИТ",
+  ylab = "Вероятность выживания",
+  main = "30-дневная выживаемость: раннее vs позднее начало ГС",
+  xlim = c(0, 30)
+)
+
+legend(
+  "bottomleft",
+  legend = levels(factor(df_km_30$early_start)),
+  col = 1:2,
+  lwd = 2,
+  bty = "n"
+)
+
+survdiff(Surv(time_30, event_30) ~ early_start, data = df_km_30)
+
+```
+
+# Outcome по антикоагуляции
+
+```{r}
+#| label: outcome_by_anticoagulation
+#| cache: true
+#| echo: false
+
+# Простая patient-level таблица исходов в зависимости от антикоагуляции.
+# Важно: берем антикоагуляцию ПЕРВОЙ гемосорбции на пациента,
+# чтобы один пациент не попадал в таблицу несколько раз.
+
+first_non_empty <- function(x) {
+  x <- as.character(x)
+  x <- x[!is.na(x) & str_squish(x) != ""]
+  if (!length(x)) return(NA_character_)
+  x[1]
+}
+
+ha_first_anticoag <- HA_tidy %>%
+  mutate(
+    HA_anticoagulation_cat = case_when(
+      HA_anticoagulation == "Цитрат"  ~ "Цитрат",
+      HA_anticoagulation == "Гепарин" ~ "Гепарин",
+      HA_anticoagulation == "Другой" &
+        norm0(coalesce(HA_anticoagulation_other, "")) %in% c("без антикоагуляции") ~ "Без антикоагуляции",
+      HA_anticoagulation == "Другой" ~ "Другой",
+      TRUE ~ "Другой"
+    )
+  ) %>%
+  arrange(pat_record_id, HA_start_dt) %>%
+  group_by(pat_record_id) %>%
+  summarise(
+    HA_anticoagulation_cat = first_non_empty(HA_anticoagulation_cat),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    HA_anticoagulation_cat = factor(
+      HA_anticoagulation_cat,
+      levels = c("Гепарин", "Цитрат", "Без антикоагуляции", "Другой")
+    )
+  )
+
+pt_outcome <- patients_tidy %>%
+  group_by(pat_record_id) %>%
+  summarise(
+    outcome = first_non_empty(outcome),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    outcome = factor(
+      outcome,
+      levels = c(
+        "Выписан из ОРИТ",
+        "Продолжает находиться в ОРИТ",
+        "Переведён в другой ОРИТ",
+        "Умер"
+      )
+    )
+  )
+
+outcome_by_anticoag_df <- pt_outcome %>%
+  left_join(ha_first_anticoag, by = "pat_record_id") %>%
+  filter(!is.na(HA_anticoagulation_cat), !is.na(outcome))
+
+tbl_outcome_by_anticoag <- outcome_by_anticoag_df %>%
+  select(HA_anticoagulation_cat, outcome) %>%
+  tbl_summary(
+    by = HA_anticoagulation_cat,
+    statistic = all_categorical() ~ "{p}% ({n})",
+    missing = "no",
+    label = list(outcome = "Исход")
+  ) %>%
+  modify_header(label = "**Исход**") %>%
+  modify_header(all_stat_cols() ~ "**{level}**, N = {n}") %>%
+  modify_caption("**Исходы в зависимости от антикоагуляции при первой гемосорбции**") %>%
+  bold_labels()
+
+tbl_outcome_by_anticoag
+
+```
+
 # Проверка VIS2020_0_excl
 
 ```{r}
@@ -1523,65 +1829,27 @@ if ("is_septic" %in% names(pt0)) {
     bold_labels()
 }
 
-# --- Патогены (грам+/грам-): на слайде оставляем только две категории ---
-# "Положительный посев" и "Отрицательный посев".
-# Категорию N/A здесь специально не показываем: она превращена в NA на этапе *_slide.
-# Важно: если после такой перекодировки в подблоке не остается ни одной непустой переменной,
-# tbl_summary() упадет на пустом наборе столбцов. Поэтому сначала проверяем,
-# какие pathogen-переменные реально есть и содержат хотя бы одно непустое значение.
-if (!"pat_gram_positive_slide" %in% names(pt0) && "pat_gram_positive" %in% names(pt0)) {
-  pt0 <- pt0 %>%
-    dplyr::mutate(
-      pat_gram_positive_slide = factor(
-        dplyr::case_when(
-          norm_txt(pat_gram_positive) %in% c("Положительный посев", "Положительный результат") ~ "Положительный посев",
-          norm_txt(pat_gram_positive) %in% c("Отрицательный посев", "Отрицательный результат") ~ "Отрицательный посев",
-          TRUE ~ NA_character_
-        ),
-        levels = c("Положительный посев", "Отрицательный посев")
-      )
-    )
-}
-if (!"pat_gram_negative_slide" %in% names(pt0) && "pat_gram_negative" %in% names(pt0)) {
-  pt0 <- pt0 %>%
-    dplyr::mutate(
-      pat_gram_negative_slide = factor(
-        dplyr::case_when(
-          norm_txt(pat_gram_negative) %in% c("Положительный посев", "Положительный результат") ~ "Положительный посев",
-          norm_txt(pat_gram_negative) %in% c("Отрицательный посев", "Отрицательный результат") ~ "Отрицательный посев",
-          TRUE ~ NA_character_
-        ),
-        levels = c("Положительный посев", "Отрицательный посев")
-      )
-    )
-}
-
-path_vars_present <- intersect(
-  c("pat_gram_positive_slide", "pat_gram_negative_slide"),
-  names(pt0)
-)
-path_vars_nonempty <- path_vars_present[
-  vapply(path_vars_present, function(v) any(!is.na(pt0[[v]])), logical(1))
-]
-
+# --- Патогены ---
 tbl_path <- NULL
-if (length(path_vars_nonempty) > 0) {
-  vars_path <- c("first_sorption_type", path_vars_nonempty)
+if ("pat_gram_stain" %in% names(pt0)) {
+  pt0_path <- pt0 %>%
+    mutate(
+      pat_gram_stain_slide = pat_gram_stain_for_tables(pat_gram_stain)
+    )
 
-  tbl_path <- pt0 %>%
-    select(any_of(vars_path)) %>%
-    tbl_summary(
-      by = first_sorption_type,
-      type = all_categorical() ~ "categorical",
-      statistic = all_categorical() ~ "{n} ({p}%)",
-      label = list(
-        pat_gram_positive_slide = "Грамположительные",
-        pat_gram_negative_slide = "Грамотрицательные"
-      ),
-      missing = "no"
-    ) %>%
-    modify_header(all_stat_cols() ~ "**{level}**, N = {n}") %>%
-    bold_labels()
+  if (any(!is.na(pt0_path$pat_gram_stain_slide))) {
+    tbl_path <- pt0_path %>%
+      select(first_sorption_type, pat_gram_stain_slide) %>%
+      tbl_summary(
+        by = first_sorption_type,
+        type = all_categorical() ~ "categorical",
+        statistic = all_categorical() ~ "{n} ({p}%)",
+        label = list(pat_gram_stain_slide = "Бактериальная флора по Граму"),
+        missing = "no"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**, N = {n}") %>%
+      bold_labels()
+  }
 }
 
 # --- Сборка в одну таблицу ---
@@ -1593,7 +1861,7 @@ if (!is.null(tbl_indications)) {
 }
 if (!is.null(tbl_path)) {
   tbl_list <- append(tbl_list, list(tbl_path))
-  hdrs <- c(hdrs, "Патогены")
+  hdrs <- c(hdrs, "Бактериальная флора по Граму")
 }
 
 tbl2 <- gtsummary::tbl_stack(tbl_list, group_header = hdrs)
@@ -1786,65 +2054,21 @@ if ("is_septic" %in% names(pt0)) {
 
 # --- Патогены ---
 tbl_path <- NULL
-if (all(c("is_pat_gram_positive", "is_pat_gram_negative") %in% names(pt0))) {
+if ("pat_gram_stain" %in% names(pt0)) {
   pt0_path <- pt0 %>%
     mutate(
-      pat_any = factor(
-        dplyr::case_when(
-          is_pat_gram_positive == 1 | is_pat_gram_negative == 1 ~ "Положительный посев",
-          is_pat_gram_positive == 0 & is_pat_gram_negative == 0 ~ "Отрицательный посев",
-          TRUE ~ NA_character_
-        ),
-        levels = c("Положительный посев", "Отрицательный посев")
-      ),
-      pat_gram_positive_slide = factor(
-        dplyr::case_when(
-          is_pat_gram_positive == 1 ~ "Положительный посев",
-          is_pat_gram_positive == 0 ~ "Отрицательный посев",
-          TRUE ~ NA_character_
-        ),
-        levels = c("Положительный посев", "Отрицательный посев")
-      ),
-      pat_gram_negative_slide = factor(
-        dplyr::case_when(
-          is_pat_gram_negative == 1 ~ "Положительный посев",
-          is_pat_gram_negative == 0 ~ "Отрицательный посев",
-          TRUE ~ NA_character_
-        ),
-        levels = c("Положительный посев", "Отрицательный посев")
-      )
+      pat_gram_stain_slide = pat_gram_stain_for_tables(pat_gram_stain)
     )
 
-  path_vars_present <- intersect(
-    c("pat_any", "pat_gram_positive_slide", "pat_gram_negative_slide"),
-    names(pt0_path)
-  )
-
-  path_vars_nonempty <- path_vars_present[
-    vapply(path_vars_present, function(v) any(!is.na(pt0_path[[v]])), logical(1))
-  ]
-
-  if (length(path_vars_nonempty) > 0) {
+  if (any(!is.na(pt0_path$pat_gram_stain_slide))) {
     tbl_path <- pt0_path %>%
-      select(first_sorption_type_total, any_of(path_vars_nonempty)) %>%
+      select(first_sorption_type_total, pat_gram_stain_slide) %>%
       tbl_summary(
         by = first_sorption_type_total,
         type = all_categorical() ~ "categorical",
         statistic = all_categorical() ~ "{n} ({p}%)",
-        label = list(
-          pat_any = "Патогены (общ.)",
-          pat_gram_positive_slide = "Грамположительные",
-          pat_gram_negative_slide = "Грамотрицательные"
-        ),
+        label = list(pat_gram_stain_slide = "Бактериальная флора по Граму"),
         missing = "no"
-      ) %>%
-      modify_table_body(
-        ~ .x %>%
-          dplyr::filter(
-            !(.data$variable == "pat_any" &
-                .data$row_type == "level" &
-                .data$label == "Отрицательный посев")
-          )
       ) %>%
       modify_header(all_stat_cols() ~ "**{level}**, N = {n}") %>%
       bold_labels()
@@ -1862,7 +2086,7 @@ if (!is.null(tbl_indications)) {
 
 if (!is.null(tbl_path)) {
   tbl_list <- append(tbl_list, list(tbl_path))
-  hdrs <- c(hdrs, "Патогены")
+  hdrs <- c(hdrs, "Бактериальная флора по Граму")
 }
 
 tbl2_total <- gtsummary::tbl_stack(tbl_list, group_header = hdrs)
@@ -2029,6 +2253,149 @@ flx4 <- gtsummary::as_flex_table(tbl4) %>%
 invisible(flextable::save_as_pptx(flx4, path = file.path(TABLES_DIR, "table4_outcomes.pptx")))
 flx4
 ```
+
+###Исходы по переводам из ОРИТ
+
+```{r}
+#| label: pptx_slide4_transfer
+#| cache: true
+#| warning: false
+#| message: false
+
+tp0 <- "m12h_0h"
+tp1 <- "48h_72h"
+
+out_df_transfer <- patients_analysis_clin_window %>%
+  group_by(pat_record_id) %>%
+  summarise(
+    from_other_ICU_transfer = first_non_na(from_other_ICU_transfer),
+    outcome_raw = first_non_na(outcome),
+    CGI_E_raw   = first_non_na(.data[[cgi_col]]),
+
+    ICU_in_dt = first_non_na(ICU_in_dt),
+    ICU_out_or_death_dt = first_non_na(ICU_out_or_death_dt),
+
+    SOFA_m12   = first_non_na(SOFA[timepoint == tp0]),
+    SOFA_48_72 = first_non_na(SOFA[timepoint == tp1]),
+
+    VIS_m12    = first_non_na(.data[[vis_col]][timepoint == tp0]),
+    VIS_48_72  = first_non_na(.data[[vis_col]][timepoint == tp1]),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    outcome_norm = norm_txt(outcome_raw),
+
+    time_to_icu_discharge_h = dplyr::case_when(
+      outcome_norm == "Выписан из ОРИТ" & !is.na(ICU_in_dt) & !is.na(ICU_out_or_death_dt) ~
+        as.numeric(difftime(ICU_out_or_death_dt, ICU_in_dt, units = "hours")),
+      TRUE ~ NA_real_
+    ),
+
+    CGI_E_2lvl = {
+      x <- norm_txt(CGI_E_raw)
+      dplyr::case_when(
+        x %in% c(
+          "Без изменений или хуже",
+          "Минимальное улучшение. Незначительное улучшение, не влияющее на клинический статус пациента"
+        ) ~ "Нет улучшений",
+        x %in% c(
+          "Отмечено значительное улучшение. Полная или почти полная ремиссия симптомов",
+          "Умеренное улучшение. Частичная ремиссия симптомов"
+        ) ~ "Есть улучшения",
+        TRUE ~ NA_character_
+      ) %>%
+        factor(levels = c("Есть улучшения", "Нет улучшений"))
+    },
+
+    SOFA_drop_2plus = dplyr::case_when(
+      !is.na(SOFA_m12) & !is.na(SOFA_48_72) ~ (SOFA_m12 - SOFA_48_72 >= 2),
+      TRUE ~ NA
+    ) %>% factor(levels = c(TRUE, FALSE), labels = c("Да", "Нет")),
+
+    VIS_drop_20plus = dplyr::case_when(
+      !is.na(VIS_m12) & !is.na(VIS_48_72) ~ (VIS_m12 - VIS_48_72 >= 20),
+      TRUE ~ NA
+    ) %>% factor(levels = c(TRUE, FALSE), labels = c("Да", "Нет")),
+
+    mortality = dplyr::case_when(
+      outcome_norm == "Умер" ~ "Умер",
+      !is.na(outcome_norm)   ~ "Не умер",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("Умер", "Не умер"))
+  )
+
+make_outcome_tbl <- function(df) {
+  df %>%
+    select(
+      time_to_icu_discharge_h,
+      CGI_E_2lvl,
+      SOFA_drop_2plus,
+      VIS_drop_20plus,
+      mortality
+    ) %>%
+    tbl_summary(
+      type = list(
+        CGI_E_2lvl ~ "dichotomous",
+        SOFA_drop_2plus ~ "dichotomous",
+        VIS_drop_20plus ~ "dichotomous",
+        mortality ~ "dichotomous"
+      ),
+      value = list(
+        CGI_E_2lvl ~ "Есть улучшения",
+        SOFA_drop_2plus ~ "Да",
+        VIS_drop_20plus ~ "Да",
+        mortality ~ "Умер"
+      ),
+      statistic = list(
+        time_to_icu_discharge_h ~ "{median} ({p25}, {p75})",
+        all_categorical() ~ "{n} ({p}%)"
+      ),
+      label = list(
+        time_to_icu_discharge_h = "Время до выписки из ОРИТ, ч",
+        CGI_E_2lvl = "CGI-E: есть улучшения",
+        SOFA_drop_2plus = "Снижение SOFA ≥ 2 за 72 ч",
+        VIS_drop_20plus = "Снижение VIS2020 ≥ 20 за 72 ч",
+        mortality = "Летальность"
+      ),
+      missing = "no"
+    ) %>%
+    bold_labels()
+}
+
+tbl4_all <- out_df_transfer %>%
+  make_outcome_tbl()
+
+tbl4_no_transfer <- out_df_transfer %>%
+  filter(from_other_ICU_transfer != "Да" | is.na(from_other_ICU_transfer)) %>%
+  make_outcome_tbl()
+
+tbl4_transfer_compare <- tbl_merge(
+  tbls = list(tbl4_all, tbl4_no_transfer),
+  tab_spanner = c(
+    paste0("**Все пациенты**, N = ", nrow(out_df_transfer)),
+    paste0(
+      "**Без перевода из другого ОРИТ**, N = ",
+      out_df_transfer %>%
+        filter(from_other_ICU_transfer != "Да" | is.na(from_other_ICU_transfer)) %>%
+        nrow()
+    )
+  )
+)
+
+flx4_transfer_compare <- gtsummary::as_flex_table(tbl4_transfer_compare) %>%
+  flextable::autofit()
+
+invisible(
+  flextable::save_as_pptx(
+    flx4_transfer_compare,
+    path = file.path(TABLES_DIR, "table4_outcomes_all_vs_no_transfer.pptx")
+  )
+)
+
+flx4_transfer_compare
+```
+
+### Пациенты/SOFA/VIS pair
 
 ```{r}
 #| label: qc_pptx_slide4_counts

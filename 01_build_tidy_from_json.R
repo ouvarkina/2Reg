@@ -317,7 +317,7 @@ norm_culture <- function(x){
   )
 }
 
-# Патогены: 1 = положительный, 0 = отрицательный, N/A = посев не проводился (как отдельная категория)
+# Унификация результатов посева для бинарной логики (например, бактериемии): 1 = положительный, 0 = отрицательный, N/A = посев не проводился/нет данных
 culture_to_1_0_na <- function(x) {
   x <- norm_txt(x)
   dplyr::case_when(
@@ -329,12 +329,230 @@ culture_to_1_0_na <- function(x) {
     factor(levels = c("1", "0", "N/A"))
 }
 
+
+# Единая классификация бактериальной флоры по грам-окраске.
+# mix   = положительный и грам+ и грам- посев
+# neg   = оба посева отрицательные
+# gram+ = положительный только грам+ посев
+# gram- = положительный только грам- посев
+# N/A   = оба посева не проводились / нет данных
+gram_stain_class <- function(gram_positive, gram_negative) {
+  gp <- norm_txt(gram_positive)
+  gn <- norm_txt(gram_negative)
+
+  gp_pos <- gp %in% c("Положительный посев", "Положительный результат")
+  gn_pos <- gn %in% c("Положительный посев", "Положительный результат")
+  gp_neg <- gp %in% c("Отрицательный посев", "Отрицательный результат")
+  gn_neg <- gn %in% c("Отрицательный посев", "Отрицательный результат")
+  gp_na  <- is.na(gp) | gp %in% c("Посев не проводился", "Не проводился", "Нет данных", "Нет значения")
+  gn_na  <- is.na(gn) | gn %in% c("Посев не проводился", "Не проводился", "Нет данных", "Нет значения")
+
+  dplyr::case_when(
+    gp_pos & gn_pos ~ "mix",
+    gp_neg & gn_neg ~ "neg",
+    gp_pos & !gn_pos ~ "gram+",
+    !gp_pos & gn_pos ~ "gram-",
+    gp_na & gn_na ~ "N/A",
+    TRUE ~ "N/A"
+  ) |>
+    factor(levels = c("mix", "gram+", "gram-", "neg", "N/A"))
+}
+
 unit_norm <- function(u){
   u <- norm_txt(u)
   u <- str_to_lower(u)
   u <- str_replace_all(u, "μ", "µ")
   u <- str_replace_all(u, "\\s+", "")
   u
+}
+
+
+# 3b. Checkbox mappings for new JSON schema --------------------------------
+
+# "ОсновнойДиагноз" (новая форма с selected/other)
+diag_checkbox_map <- c(
+  "Злокачественное новообразование" = "diag_bin_malignancy",
+  "Инфекция мочевыводящих путей" = "diag_bin_urinary_tract_infection",
+  "Инфекция мягких тканей" = "diag_bin_soft_tissue_infection",
+  "Менингит" = "diag_bin_meningitis",
+  "Ожоги/термоингаляционная травма" = "diag_bin_burn_inhalation_injury",
+  "Остеомиелит" = "diag_bin_osteomyelitis",
+  "Острый панкреатит" = "diag_bin_acute_pancreatitis",
+  "Перитонит" = "diag_bin_peritonitis",
+  "Пиелонефрит" = "diag_bin_pyelonephritis",
+  "Пневмония" = "diag_bin_pneumonia",
+  "Состояние после массивного хирургического вмешательства" = "diag_bin_post_major_surgery",
+  "Травма" = "diag_bin_trauma",
+  "Холангит и инфекция желчевыводящих путей" = "diag_bin_cholangitis_biliary_infection",
+  "Экзогенная интоксикация" = "diag_bin_exogenous_intoxication",
+  "Эндокардит" = "diag_bin_endocarditis",
+  "Другое (указать)" = "diag_bin_other"
+)
+
+diag_checkbox_aliases <- c(
+  "Другое" = "Другое (указать)",
+  "После массивного хирургического вмешательства" = "Состояние после массивного хирургического вмешательства"
+)
+
+# "ПоказанияГС" (новая форма с selected/other)
+ind_checkbox_map <- c(
+  "Бактериемия (подтвержденная или подозреваемая)" = "ind_bin_bacteremia",
+  "Рабдомиолиз" = "ind_bin_rhabdomyolysis",
+  "Сепсис (подтвержденный или подозреваемый)" = "ind_bin_sepsis",
+  "Ишемия-реперфузионное повреждение" = "ind_bin_ischemia_reperfusion_injury",
+  "Септический шок" = "ind_bin_septic_shock",
+  "Массивный некроз тканей" = "ind_bin_massive_tissue_necrosis",
+  "Синдром капиллярной утечки" = "ind_bin_capillary_leak_syndrome",
+  "Острая печёночная недостаточность" = "ind_bin_acute_liver_failure",
+  "Синдром полиорганной недостаточности (СПОН)" = "ind_bin_multiorgan_failure",
+  "Острая почечная недостаточность" = "ind_bin_acute_kidney_injury",
+  "Повышенный уровень лактата" = "ind_bin_elevated_lactate",
+  "Синдром системного воспалительного ответа (ССВР)" = "ind_bin_systemic_inflammatory_response",
+  "Повышенный уровень маркеров воспаления" = "ind_bin_elevated_inflammatory_markers",
+  "Эндогенная интоксикация" = "ind_bin_endogenous_intoxication",
+  "Другое" = "ind_bin_other"
+)
+
+ind_checkbox_aliases <- c(
+  "Другое (указать)" = "Другое",
+  "Ишемия–реперфузионное повреждение" = "Ишемия-реперфузионное повреждение",
+  "Синдром полиорганной недостаточности" = "Синдром полиорганной недостаточности (СПОН)",
+  "Синдром системного воспалительного ответа" = "Синдром системного воспалительного ответа (ССВР)"
+)
+
+# Исторический переход формы:
+# раньше часть checkbox-вариантов, которые сейчас относятся к основному диагнозу,
+# могла приходить внутри блока "ПоказанияГС". Не создаём для них ind_bin_*;
+# при checkbox-разборе переносим их в диагнозные признаки / raw selected.
+legacy_indication_as_diag <- c(
+  "Изменения показателей биохимического анализа крови" = "Другое (указать)",
+  "После массивного хирургического вмешательства" = "Состояние после массивного хирургического вмешательства",
+  "Экзогенная интоксикация" = "Экзогенная интоксикация"
+)
+
+# Только scalar character: если пришёл list (например новый checkbox-объект), возвращаем NA.
+chr_scalar0 <- function(x) {
+  if (is.null(x) || length(x) == 0 || is.list(x)) return(NA_character_)
+  clean_na(as.character(x)[1])
+}
+
+# Нормализованный ключ для сопоставления checkbox-значений.
+# Нужен, потому что в JSON встречаются варианты с/без скобок, с разными тире,
+# а иногда без аббревиатур СПОН/ССВР.
+checkbox_key <- function(x) {
+  x <- norm_txt(x)
+  x <- stringr::str_replace_all(x, "ё", "е")
+  x <- stringr::str_replace_all(x, "Ё", "Е")
+  x <- stringr::str_to_lower(x)
+  x <- stringr::str_replace_all(x, "[\\(\\)]", " ")
+  x <- stringr::str_replace_all(x, "[^[:alnum:]а-яА-Я]+", " ")
+  x <- stringr::str_squish(x)
+  x[x == ""] <- NA_character_
+  x
+}
+
+checkbox_selected <- function(x) {
+  if (!is.list(x)) return(character(0))
+  sel <- pluck0(x, "selected", .default = character(0))
+  if (is.null(sel) || !length(sel)) return(character(0))
+  norm_txt(unlist(sel, use.names = FALSE))
+}
+
+checkbox_other <- function(x) {
+  if (!is.list(x)) return(NA_character_)
+  chr0(pluck0(x, "other", .default = NA_character_))
+}
+
+checkbox_apply_aliases <- function(selected, aliases = NULL) {
+  selected <- norm_txt(selected)
+  if (!length(selected) || is.null(aliases) || !length(aliases)) return(selected)
+
+  alias_keys <- checkbox_key(names(aliases))
+  selected_keys <- checkbox_key(selected)
+  hit <- match(selected_keys, alias_keys)
+
+  out <- selected
+  out[!is.na(hit)] <- unname(aliases)[hit[!is.na(hit)]]
+  out
+}
+
+checkbox_with_extra_selected <- function(x, extra_selected = character(0), extra_other = character(0)) {
+  extra_selected <- norm_txt(extra_selected)
+  extra_selected <- extra_selected[!is.na(extra_selected) & extra_selected != ""]
+  extra_other <- norm_txt(extra_other)
+  extra_other <- extra_other[!is.na(extra_other) & extra_other != ""]
+
+  if (!length(extra_selected) && !length(extra_other)) return(x)
+
+  if (is.list(x) && any(c("selected", "other") %in% names(x))) {
+    x$selected <- unique(c(checkbox_selected(x), extra_selected))
+    other_pieces <- c(checkbox_other(x), extra_other)
+    other_pieces <- other_pieces[!is.na(other_pieces) & other_pieces != ""]
+    x$other <- if (length(other_pieces)) paste(unique(other_pieces), collapse = " | ") else NA_character_
+    return(x)
+  }
+
+  list(
+    selected = unique(extra_selected),
+    other = if (length(extra_other)) paste(unique(extra_other), collapse = " | ") else NA_character_
+  )
+}
+
+checkbox_drop_selected <- function(x, drop_selected = character(0)) {
+  if (!is.list(x) || !any(c("selected", "other") %in% names(x))) return(x)
+
+  drop_selected <- norm_txt(drop_selected)
+  selected <- checkbox_selected(x)
+  x$selected <- selected[!(selected %in% drop_selected)]
+  x
+}
+
+# Для обратной совместимости:
+# - если поле было строкой, используем её;
+# - если поле стало checkbox-объектом, склеиваем selected (+ other) в одну строку.
+checkbox_collapse <- function(x, aliases = NULL) {
+  if (!is.list(x)) return(NA_character_)
+  sel <- checkbox_apply_aliases(checkbox_selected(x), aliases = aliases)
+  oth <- checkbox_other(x)
+  pieces <- c(sel, oth)
+  pieces <- pieces[!is.na(pieces) & pieces != ""]
+  if (!length(pieces)) return(NA_character_)
+  paste(unique(pieces), collapse = " | ")
+}
+
+# Возвращает список колонок dummy/text для одной checkbox-переменной.
+# Старые записи без selected/other получают NA в новых колонках.
+# Новые записи с checkbox-структурой получают 0/1 + text/raw.
+checkbox_cols <- function(x, mapping, aliases = NULL, other_col, raw_col = NULL) {
+  has_checkbox <- is.list(x) && any(c("selected", "other") %in% names(x))
+  init_val <- if (has_checkbox) 0L else NA_integer_
+
+  out <- as.list(rep(init_val, length(mapping)))
+  names(out) <- unname(mapping)
+
+  sel_raw <- checkbox_selected(x)
+  sel_std <- checkbox_apply_aliases(sel_raw, aliases = aliases)
+
+  # Сопоставляем не по буквальному тексту, а по нормализованному ключу:
+  # это защищает от вариантов "СПОН"/без "СПОН", "ССВР"/без "ССВР",
+  # разных тире и пробелов.
+  map_keys <- checkbox_key(names(mapping))
+  sel_keys <- checkbox_key(sel_std)
+  hit <- match(sel_keys, map_keys)
+  hit <- hit[!is.na(hit)]
+
+  if (length(hit)) {
+    matched_cols <- unique(unname(mapping[hit]))
+    out[matched_cols] <- rep(list(1L), length(matched_cols))
+  }
+
+  out[[other_col]] <- if (has_checkbox) checkbox_other(x) else NA_character_
+
+  if (!is.null(raw_col)) {
+    out[[raw_col]] <- if (has_checkbox && length(sel_raw)) paste(sel_raw, collapse = " | ") else NA_character_
+  }
+
+  out
 }
 
 # 4. Read inputs ----------------------------------------------------------
@@ -394,6 +612,37 @@ extract_patient_rows <- function(pat_record_id, record_author, organization, cre
   rrt_block   <- pluck0(organ_block, "ЗПТ", .default = list())
   ecmo_block  <- pluck0(organ_block, "ЭКМО", .default = list())
   
+  diag_block <- pluck0(d, "ОсновнойДиагноз", .default = NULL)
+  ind_block  <- pluck0(d, "ПоказанияГС", .default = NULL)
+
+  legacy_diag_from_ind <- checkbox_selected(ind_block)
+  legacy_diag_from_ind <- legacy_diag_from_ind[legacy_diag_from_ind %in% names(legacy_indication_as_diag)]
+  legacy_diag_selected <- unname(legacy_indication_as_diag[legacy_diag_from_ind])
+  legacy_diag_other <- legacy_diag_from_ind[legacy_diag_selected == "Другое (указать)"]
+
+  diag_block_for_checkbox <- checkbox_with_extra_selected(
+    diag_block,
+    extra_selected = legacy_diag_selected,
+    extra_other    = legacy_diag_other
+  )
+  ind_block_for_checkbox <- checkbox_drop_selected(ind_block, names(legacy_indication_as_diag))
+
+  diag_cols <- checkbox_cols(
+    x = diag_block_for_checkbox,
+    mapping = diag_checkbox_map,
+    aliases = diag_checkbox_aliases,
+    other_col = "diag_other_text",
+    raw_col   = "diag_selected_raw"
+  )
+
+  ind_cols <- checkbox_cols(
+    x = ind_block_for_checkbox,
+    mapping = ind_checkbox_map,
+    aliases = ind_checkbox_aliases,
+    other_col = "ind_other_text",
+    raw_col   = "ind_selected_raw"
+  )
+
   static <- tibble::tibble(
     pat_record_id = chr0(pat_record_id),
     record_author = chr0(record_author),
@@ -410,8 +659,16 @@ extract_patient_rows <- function(pat_record_id, record_author, organization, cre
     
     # Базовые сведения / анамнез
     admission_date          = chr0(pluck0(d, "ДатаГоспитализации", .default = NA_character_)),
-    diagnoses               = chr0(pluck0(d, "Диагнозы", .default = NA_character_)),
-    HA_indications          = chr0(pluck0(d, "ПоказанияГС", .default = NA_character_)),
+    diagnoses               = dplyr::coalesce(
+      chr_scalar0(pluck0(d, "Диагнозы", .default = NA_character_)),
+      checkbox_collapse(diag_block_for_checkbox, aliases = diag_checkbox_aliases)
+    ),
+    HA_indications          = dplyr::coalesce(
+      chr_scalar0(pluck0(d, "ПоказанияГС", .default = NA_character_)),
+      checkbox_collapse(ind_block_for_checkbox, aliases = ind_checkbox_aliases)
+    ),
+    !!!diag_cols,
+    !!!ind_cols,
     ICU_6_month_history     = chr0(pluck0(d, "ПребываниеВОРИТВПоследние6Мес", .default = NA_character_)),
     from_other_ICU_transfer = chr0(pluck0(d, "ПереводИзДругогоОРИТ", .default = NA_character_)),
     
@@ -422,7 +679,7 @@ extract_patient_rows <- function(pat_record_id, record_author, organization, cre
     
     charlson_index = num0(pluck0(d, "ИндексЧарлсон", .default = NA)),
     
-    # Патогены
+    # Исходные поля посевов по грам-окраске
     pat_gram_positive = chr0(norm_culture(pluck0(d, "Грамположительные", .default = NA_character_))),
     pat_gram_negative = chr0(norm_culture(pluck0(d, "Грамотрицательные", .default = NA_character_))),
     pat_bacteremia    = chr0(norm_culture(pluck0(d, "Бактериемия", .default = NA_character_))),
@@ -979,13 +1236,12 @@ if (all(c("SOFA", "status") %in% names(patients_tidy))) {
     )
 }
 
-# Патогены:
-if ("pat_gram_positive" %in% names(patients_tidy)) {
-  patients_tidy$is_pat_gram_positive <- culture_to_1_0_na(patients_tidy$pat_gram_positive)
-}
-
-if ("pat_gram_negative" %in% names(patients_tidy)) {
-  patients_tidy$is_pat_gram_negative <- culture_to_1_0_na(patients_tidy$pat_gram_negative)
+# Единая колонка бактериальной флоры по грам-окраске:
+if (all(c("pat_gram_positive", "pat_gram_negative") %in% names(patients_tidy))) {
+  patients_tidy <- patients_tidy %>%
+    dplyr::mutate(
+      pat_gram_stain = gram_stain_class(pat_gram_positive, pat_gram_negative)
+    )
 }
 
 if ("pat_bacteremia" %in% names(patients_tidy)) {
@@ -993,7 +1249,7 @@ if ("pat_bacteremia" %in% names(patients_tidy)) {
 }
 
 # is_septic: 1, если есть признаки сепсиса/септ.шока по показаниям
-# ИЛИ грамотрицательный посев ИЛИ бактериемия ИЛИ PCT > 10 на m12h_0h; иначе 0
+# ИЛИ pat_gram_stain == gram- / mix ИЛИ бактериемия ИЛИ PCT > 10 на m12h_0h; иначе 0
 if (all(c("pat_record_id", "HA_indications") %in% names(patients_tidy))) {
   
   if (all(c("timepoint", "procalcitonin") %in% names(patients_tidy))) {
@@ -1014,7 +1270,9 @@ if (all(c("pat_record_id", "HA_indications") %in% names(patients_tidy))) {
     dplyr::mutate(
       is_septic = dplyr::if_else(
         stringr::str_detect(stringr::str_to_lower(dplyr::coalesce(HA_indications, "")), "\\bсепсис\\b|(?<!а)септическ") |
-          dplyr::coalesce(as.character(is_pat_gram_negative), "") == "1" |
+          dplyr::coalesce(ind_bin_sepsis, 0L) == 1L |
+          dplyr::coalesce(ind_bin_septic_shock, 0L) == 1L |
+          dplyr::coalesce(as.character(pat_gram_stain), "") %in% c("gram-", "mix") |
           dplyr::coalesce(as.character(is_bacteremic), "") == "1" |
           dplyr::coalesce(.septic_pct, FALSE),
         1L, 0L
