@@ -32,6 +32,11 @@ pick_path <- function(path_candidates) {
   hit
 }
 
+optional_path <- function(path_candidates) {
+  hit <- path_candidates[file.exists(path_candidates)][1]
+  if (is.na(hit)) NA_character_ else hit
+}
+
 registry_file <- pick_path(c(
   file.path(DATA_DIR, "registry2-accepted-records.json"),
   file.path("/mnt/data", DATA_DIR, "registry2-accepted-records.json"),
@@ -48,6 +53,14 @@ orgs_file <- pick_path(c(
   file.path(DATA_DIR, "organizations.json"),
   file.path("/mnt/data", DATA_DIR, "organizations.json"),
   "organizations.json"
+))
+
+# Ручная разметка старых free-text диагнозов/показаний к ГС.
+# Файл опционален: если его нет, ETL продолжит работу только по JSON.
+patients_indications_file <- optional_path(c(
+  file.path(DATA_DIR, "2Reg_patients_indications.xlsx"),
+  file.path("/mnt/data", DATA_DIR, "2Reg_patients_indications.xlsx"),
+  "2Reg_patients_indications.xlsx"
 ))
 
 # output paths / flags
@@ -551,6 +564,132 @@ checkbox_cols <- function(x, mapping, aliases = NULL, other_col, raw_col = NULL)
   if (!is.null(raw_col)) {
     out[[raw_col]] <- if (has_checkbox && length(sel_raw)) paste(sel_raw, collapse = " | ") else NA_character_
   }
+
+  out
+}
+
+
+# Приводит ручные bin-колонки из Excel к 0/1/NA.
+# Поддерживает числа 0/1 и частые текстовые варианты на случай ручного ввода.
+manual_bin_to_int <- function(x) {
+  x <- clean_na(as.character(x))
+  x <- stringr::str_to_lower(x)
+  x <- stringr::str_replace_all(x, ",", ".")
+  dplyr::case_when(
+    x %in% c("1", "1.0", "да", "true", "yes", "y") ~ 1L,
+    x %in% c("0", "0.0", "нет", "false", "no", "n") ~ 0L,
+    TRUE ~ NA_integer_
+  )
+}
+
+# Добавляет ручную разметку старых free-text записей из data/2Reg_patients_indications.xlsx.
+# Логика:
+# - join только по pat_record_id;
+# - diagnoses и HA_indications из JSON не перезаписываем;
+# - обновляем только существующие в patients_tidy diag_bin_*/ind_bin_* и *_other_text;
+# - если в manual Excel bin-колонки целиком пустые, ничего не затираем нулями.
+apply_manual_indications <- function(patients_tidy, path, blank_binary_as_zero = TRUE) {
+  if (is.na(path) || !file.exists(path)) {
+    message("Manual indications file not found; skip manual diagnosis/indication merge.")
+    return(patients_tidy)
+  }
+
+  manual_raw <- openxlsx::read.xlsx(path, sheet = 1, detectDates = FALSE)
+  manual_raw <- tibble::as_tibble(manual_raw)
+
+  if (!"pat_record_id" %in% names(manual_raw)) {
+    stop("В файле ручной разметки нет обязательной колонки pat_record_id: ", path)
+  }
+
+  manual_raw <- manual_raw %>%
+    dplyr::mutate(pat_record_id = clean_na(.data$pat_record_id)) %>%
+    dplyr::filter(!is.na(.data$pat_record_id), .data$pat_record_id != "")
+
+  dup_ids <- manual_raw %>%
+    dplyr::count(pat_record_id, name = "n") %>%
+    dplyr::filter(n > 1)
+
+  if (nrow(dup_ids) > 0) {
+    warning(
+      "В ручной разметке есть повторяющиеся pat_record_id; оставлена первая строка для каждого id. Примеры: ",
+      paste(utils::head(dup_ids$pat_record_id, 10), collapse = ", ")
+    )
+    manual_raw <- manual_raw %>% dplyr::distinct(pat_record_id, .keep_all = TRUE)
+  }
+
+  manual_bin_cols <- names(manual_raw)[stringr::str_detect(names(manual_raw), "^(diag|ind)_bin_")]
+  manual_bin_cols <- intersect(manual_bin_cols, names(patients_tidy))
+
+  manual_text_cols <- intersect(c("diag_other_text", "ind_other_text"), names(manual_raw))
+  manual_text_cols <- intersect(manual_text_cols, names(patients_tidy))
+
+  if (length(c(manual_bin_cols, manual_text_cols)) == 0) {
+    message("Manual indications file has no columns matching patients_tidy; skip merge.")
+    return(patients_tidy)
+  }
+
+  manual_tbl <- manual_raw %>%
+    dplyr::select(
+      dplyr::all_of("pat_record_id"),
+      dplyr::all_of(manual_bin_cols),
+      dplyr::all_of(manual_text_cols)
+    )
+
+  for (nm in manual_bin_cols) {
+    manual_tbl[[nm]] <- manual_bin_to_int(manual_tbl[[nm]])
+  }
+
+  has_any_manual_bin <- length(manual_bin_cols) > 0 &&
+    any(!is.na(unlist(manual_tbl[manual_bin_cols], use.names = FALSE)))
+
+  if (length(manual_bin_cols) > 0 && isTRUE(blank_binary_as_zero) && has_any_manual_bin) {
+    # После ручной проверки пустая bin-ячейка трактуется как 0,
+    # но только если в файле вообще есть хотя бы одно заполненное bin-значение.
+    for (nm in manual_bin_cols) {
+      manual_tbl[[nm]][is.na(manual_tbl[[nm]])] <- 0L
+    }
+  }
+
+  if (length(manual_text_cols) > 0) {
+    for (nm in manual_text_cols) {
+      manual_tbl[[nm]] <- clean_na(manual_tbl[[nm]])
+    }
+  }
+
+  update_cols <- c(
+    if (has_any_manual_bin) manual_bin_cols else character(0),
+    manual_text_cols
+  )
+
+  if (length(update_cols) == 0) {
+    warning(
+      "Файл ручной разметки найден, но в bin-колонках нет ни одного 0/1-значения; ",
+      "patients_tidy не изменён по ручным диагнозам/показаниям."
+    )
+    return(patients_tidy)
+  }
+
+  manual_tbl <- manual_tbl %>%
+    dplyr::select(dplyr::all_of("pat_record_id"), dplyr::all_of(update_cols)) %>%
+    dplyr::rename_with(~ paste0(.x, "__manual"), .cols = -dplyr::all_of("pat_record_id"))
+
+  out <- patients_tidy %>%
+    dplyr::left_join(manual_tbl, by = "pat_record_id")
+
+  for (nm in update_cols) {
+    manual_nm <- paste0(nm, "__manual")
+    idx <- !is.na(out[[manual_nm]])
+    out[[nm]][idx] <- out[[manual_nm]][idx]
+  }
+
+  out <- out %>% dplyr::select(-dplyr::ends_with("__manual"))
+
+  message(
+    "Manual indications merged: ",
+    dplyr::n_distinct(manual_raw$pat_record_id), " ids in file; ",
+    sum(patients_tidy$pat_record_id %in% manual_raw$pat_record_id), " patients_tidy rows matched; ",
+    length(update_cols), " columns updated."
+  )
 
   out
 }
@@ -1172,6 +1311,17 @@ patients_tidy <- patients_tidy %>%
     is_lps_72h = coalesce(as.integer(is_lps_72h), 0L)
   )
 
+# 12b. Manual diagnosis/indication review --------------------------------
+
+# Для записей из старой формы без checkbox-структуры подставляем ручную разметку
+# из data/2Reg_patients_indications.xlsx. Разметка применяется ко всем строкам
+# patients_tidy с pat_record_id, который есть в Excel-файле.
+patients_tidy <- apply_manual_indications(
+  patients_tidy,
+  patients_indications_file,
+  blank_binary_as_zero = TRUE
+)
+
 # 13. Postprocess: status / outcomes / pathogen recodes ------------------
 
 # patient status по таймпойнтам (in / out / dead / n/a)
@@ -1236,12 +1386,15 @@ if (all(c("SOFA", "status") %in% names(patients_tidy))) {
     )
 }
 
-# Единая колонка бактериальной флоры по грам-окраске:
+# Единая колонка бактериальной флоры по грам-окраске + бинарные индикаторы по каждому посеву:
 if (all(c("pat_gram_positive", "pat_gram_negative") %in% names(patients_tidy))) {
   patients_tidy <- patients_tidy %>%
     dplyr::mutate(
-      pat_gram_stain = gram_stain_class(pat_gram_positive, pat_gram_negative)
-    )
+      pat_gram_stain    = gram_stain_class(pat_gram_positive, pat_gram_negative),
+      is_pat_gram_plus  = culture_to_1_0_na(pat_gram_positive),
+      is_pat_gram_minus = culture_to_1_0_na(pat_gram_negative)
+    ) %>%
+    dplyr::relocate(pat_gram_stain, is_pat_gram_plus, is_pat_gram_minus, .after = pat_gram_negative)
 }
 
 if ("pat_bacteremia" %in% names(patients_tidy)) {
