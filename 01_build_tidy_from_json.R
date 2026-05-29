@@ -910,6 +910,7 @@ extract_patient_rows <- function(pat_record_id, record_author, organization, cre
       SOFA    = num0(pluck0(cl, "балSOFA", .default = NA)),
       VIS2020 = num0(pluck0(cl, "индексVIS2020", .default = NA)),
       avg_BP  = num0(pluck0(cl, "среднееАД", .default = NA)),
+      INR     = num0(pluck0(cl, "МНО", .default = NA)),
       PaFiO2  = num0(pluck0(cl, "PaO2_FiO2", .default = NA)),
       SpFiO2  = num0(pluck0(cl, "SpO2_FiO2", .default = NA)),
       
@@ -1154,34 +1155,45 @@ if (all(c("PaFiO2", "SpFiO2") %in% names(patients_tidy))) {
 # 11. Postprocess: lab unit harmonization ---------------------------------
 
 # Фибриноген -> мг/дл
-if (all(c("fibrinogen","fibrinogen_unit") %in% names(patients_tidy))) {
+if (all(c("fibrinogen", "fibrinogen_unit") %in% names(patients_tidy))) {
   patients_tidy$fibrinogen_raw      <- patients_tidy$fibrinogen
   patients_tidy$fibrinogen_unit_raw <- patients_tidy$fibrinogen_unit
   
   fu <- unit_norm(patients_tidy$fibrinogen_unit)
+  
   is_gdl  <- !is.na(fu) & str_detect(fu, "^(г|g)/(дл|dl)\\.?$")
   is_gl   <- !is.na(fu) & str_detect(fu, "^(г|g)/(л|l)\\.?$")
   is_mgl  <- !is.na(fu) & str_detect(fu, "^(мг|mg)/(л|l)\\.?$")
   is_mgdl <- !is.na(fu) & str_detect(fu, "^(мг|mg)/(дл|dl)\\.?$")
   
+  # Если указано г/дл, но значение > 100, считаем, что это ошибка ввода:
+  # фактически значение уже в мг/дл, поэтому не умножаем на 1000.
+  is_gdl_but_probably_mgdl <- is_gdl & !is.na(patients_tidy$fibrinogen) &
+    patients_tidy$fibrinogen > 100
+  
   patients_tidy$fibrinogen <- dplyr::case_when(
-    is_gdl ~ patients_tidy$fibrinogen * 1000,  # g/dl -> mg/dl
-    is_gl  ~ patients_tidy$fibrinogen * 100,   # g/l  -> mg/dl
-    is_mgl ~ patients_tidy$fibrinogen / 10,    # mg/l -> mg/dl
-    TRUE   ~ patients_tidy$fibrinogen
+    is_gdl_but_probably_mgdl ~ patients_tidy$fibrinogen,          # likely mg/dl
+    is_gdl                   ~ patients_tidy$fibrinogen * 1000,   # g/dl -> mg/dl
+    is_gl                    ~ patients_tidy$fibrinogen * 100,    # g/l  -> mg/dl
+    is_mgl                   ~ patients_tidy$fibrinogen / 10,     # mg/l -> mg/dl
+    is_mgdl                  ~ patients_tidy$fibrinogen,          # mg/dl -> mg/dl
+    TRUE                     ~ NA_real_
   )
+  
   patients_tidy$fibrinogen_unit <- dplyr::case_when(
     is_gdl | is_gl | is_mgl | is_mgdl ~ "мг/дл",
-    TRUE ~ patients_tidy$fibrinogen_unit
+    TRUE ~ NA_character_
   )
 }
 
+
 # Общий билирубин -> мкмоль/л
-if (all(c("bilirubin_total","bilirubin_total_unit") %in% names(patients_tidy))) {
+if (all(c("bilirubin_total", "bilirubin_total_unit") %in% names(patients_tidy))) {
   patients_tidy$bilirubin_total_raw      <- patients_tidy$bilirubin_total
   patients_tidy$bilirubin_total_unit_raw <- patients_tidy$bilirubin_total_unit
   
   bu <- unit_norm(patients_tidy$bilirubin_total_unit)
+  
   is_mmol <- !is.na(bu) & str_detect(bu, "^(ммоль|mmol)/(л|l)\\.?$")
   is_umol <- !is.na(bu) & str_detect(bu, "^(мкмоль|umol|µmol)/(л|l)\\.?$")
   is_mgdl <- !is.na(bu) & str_detect(bu, "^(мг|mg)/(дл|dl)\\.?$")
@@ -1189,22 +1201,26 @@ if (all(c("bilirubin_total","bilirubin_total_unit") %in% names(patients_tidy))) 
   
   patients_tidy$bilirubin_total <- dplyr::case_when(
     is_mmol ~ patients_tidy$bilirubin_total * 1000,     # mmol/l -> µmol/l
+    is_umol ~ patients_tidy$bilirubin_total,            # µmol/l -> µmol/l
     is_mgdl ~ patients_tidy$bilirubin_total * 17.104,   # mg/dl  -> µmol/l
     is_mgl  ~ patients_tidy$bilirubin_total * 1.7104,   # mg/l   -> µmol/l
-    TRUE    ~ patients_tidy$bilirubin_total
+    TRUE    ~ NA_real_
   )
+  
   patients_tidy$bilirubin_total_unit <- dplyr::case_when(
     is_mmol | is_umol | is_mgdl | is_mgl ~ "мкмоль/л",
-    TRUE ~ patients_tidy$bilirubin_total_unit
+    TRUE ~ NA_character_
   )
 }
 
+
 # D-димер -> мг/л FEU
-if (all(c("D_dimer","D_dimer_unit") %in% names(patients_tidy))) {
+if (all(c("D_dimer", "D_dimer_unit") %in% names(patients_tidy))) {
   patients_tidy$D_dimer_raw      <- patients_tidy$D_dimer
   patients_tidy$D_dimer_unit_raw <- patients_tidy$D_dimer_unit
   
   du <- unit_norm(patients_tidy$D_dimer_unit)
+  
   is_mgl  <- !is.na(du) & str_detect(du, "^(мг|mg)/(л|l)")
   is_mgdl <- !is.na(du) & str_detect(du, "^(мг|mg)/(дл|dl)")
   is_ugml <- !is.na(du) & str_detect(du, "^(мкг|µg|ug)/(мл|ml)")
@@ -1214,21 +1230,30 @@ if (all(c("D_dimer","D_dimer_unit") %in% names(patients_tidy))) {
   is_feu  <- !is.na(du) & str_detect(du, "feu|феу")
   is_ddu  <- !is.na(du) & str_detect(du, "ddu")
   
-  # сначала приводим к мг/л, затем (если DDU) -> FEU (×2)
+  is_d_dimer_unit_known <- is_mgl | is_mgdl | is_ugml | is_ugl | is_ngml
+  
+  # Сначала приводим концентрацию к мг/л.
   d_mgl <- dplyr::case_when(
     is_mgdl ~ patients_tidy$D_dimer * 10,      # mg/dl -> mg/l
     is_mgl  ~ patients_tidy$D_dimer,           # mg/l  -> mg/l
     is_ugml ~ patients_tidy$D_dimer,           # µg/ml -> mg/l
     is_ugl  ~ patients_tidy$D_dimer / 1000,    # µg/l  -> mg/l
     is_ngml ~ patients_tidy$D_dimer / 1000,    # ng/ml -> mg/l
-    TRUE    ~ patients_tidy$D_dimer
+    TRUE    ~ NA_real_
   )
-  d_mgl <- dplyr::if_else(is_ddu & !is.na(d_mgl), d_mgl * 2, d_mgl)
   
-  patients_tidy$D_dimer <- d_mgl
+  # Если явно указано DDU, переводим в FEU.
+  # Если FEU не указан, но единица концентрации известна, оставляем как мг/л
+  # и считаем целевой единицей мг/л FEU.
+  patients_tidy$D_dimer <- dplyr::case_when(
+    is_d_dimer_unit_known & is_ddu ~ d_mgl * 2,
+    is_d_dimer_unit_known          ~ d_mgl,
+    TRUE                           ~ NA_real_
+  )
+  
   patients_tidy$D_dimer_unit <- dplyr::case_when(
-    is_mgl | is_mgdl | is_ugml | is_ugl | is_ngml | is_feu | is_ddu ~ "мг/л FEU",
-    TRUE ~ patients_tidy$D_dimer_unit
+    is_d_dimer_unit_known ~ "мг/л FEU",
+    TRUE ~ NA_character_
   )
 }
 
@@ -1507,6 +1532,7 @@ qc_missing_pat <- tibble::tibble(
     "ICU_out_or_death_dt",
     "first_sorption_dt",
     "status",
+    "INR",
     "PaFiO2",
     "SpFiO2",
     "PaFiO2_calc"
@@ -1516,6 +1542,7 @@ qc_missing_pat <- tibble::tibble(
     count_na_col(patients_tidy, "ICU_out_or_death_dt"),
     count_na_col(patients_tidy, "first_sorption_dt"),
     count_na_col(patients_tidy, "status"),
+    count_na_col(patients_tidy, "INR"),
     count_na_col(patients_tidy, "PaFiO2"),
     count_na_col(patients_tidy, "SpFiO2"),
     count_na_col(patients_tidy, "PaFiO2_calc")
