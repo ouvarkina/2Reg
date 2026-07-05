@@ -14,6 +14,7 @@ suppressPackageStartupMessages({
   library(openxlsx)
   library(lubridate)
   library(jsonlite)
+  library(googlesheets4)
 })
 
 # 2. Paths and flags ------------------------------------------------------
@@ -73,6 +74,13 @@ ha_out_rds        <- file.path(DATA_DIR, "HA_tidy.rds")
 REPORT_TZ <- "UTC"
 save_xlsx <- TRUE
 save_rds  <- TRUE
+
+# Google Dictionary for baseline rank rules.
+# Each colleague authorizes with their own Google account at first run.
+dictionary_url <- "https://docs.google.com/spreadsheets/d/1bsOuvblNg1l3tNiAV8Se_Kf4_IcQjsRtxISyNzoQqLw/edit"
+dictionary_sheet <- "Dictionary"
+build_baseline_ranks <- TRUE
+baseline_timepoint_for_ranks <- "m12h_0h"
 
 # 3. Small helpers --------------------------------------------------------
 
@@ -899,6 +907,40 @@ extract_patient_rows <- function(pat_record_id, record_author, organization, cre
     fib_obj     <- pluck0(bi, "Фибриноген", .default = NULL)
     bili_obj    <- pluck0(bi, "Общий_билирубин", .default = NULL)
     
+    # Оксигенация:
+    # старая структура: pao2FiO2Params$fiO2 / paO2;
+    # новая структура: oiParams$FiO2 / PaO2 / SpO2
+    # и дублирующий блок OxygenationIndex.
+    
+    FiO2_raw <- dplyr::coalesce(
+      num0(pluck0(cl, "oiParams", "FiO2", .default = NA)),
+      num0(pluck0(cl, "OxygenationIndex", "FiO2", .default = NA)),
+      num0(pluck0(cl, "pao2FiO2Params", "fiO2", .default = NA))
+    )
+    
+    PaO2_raw <- dplyr::coalesce(
+      num0(pluck0(cl, "oiParams", "PaO2", .default = NA)),
+      num0(pluck0(cl, "OxygenationIndex", "PaO2", .default = NA)),
+      num0(pluck0(cl, "pao2FiO2Params", "paO2", .default = NA))
+    )
+    
+    SpO2_raw <- dplyr::coalesce(
+      num0(pluck0(cl, "oiParams", "SpO2", .default = NA)),
+      num0(pluck0(cl, "OxygenationIndex", "SpO2", .default = NA))
+    )
+    
+    PaFiO2_from_raw <- dplyr::if_else(
+      !is.na(PaO2_raw) & !is.na(FiO2_raw) & FiO2_raw > 0,
+      PaO2_raw / (FiO2_raw / 100),
+      NA_real_
+    )
+    
+    SpFiO2_from_raw <- dplyr::if_else(
+      !is.na(SpO2_raw) & !is.na(FiO2_raw) & FiO2_raw > 0,
+      SpO2_raw / (FiO2_raw / 100),
+      NA_real_
+    )
+    
     tibble::tibble(
       timepoint = tp,
       
@@ -911,8 +953,19 @@ extract_patient_rows <- function(pat_record_id, record_author, organization, cre
       VIS2020 = num0(pluck0(cl, "индексVIS2020", .default = NA)),
       avg_BP  = num0(pluck0(cl, "среднееАД", .default = NA)),
       INR     = num0(pluck0(cl, "МНО", .default = NA)),
-      PaFiO2  = num0(pluck0(cl, "PaO2_FiO2", .default = NA)),
-      SpFiO2  = num0(pluck0(cl, "SpO2_FiO2", .default = NA)),
+      FiO2 = FiO2_raw,
+      PaO2 = PaO2_raw,
+      SpO2 = SpO2_raw,
+      
+      PaFiO2 = dplyr::coalesce(
+        num0(pluck0(cl, "PaO2_FiO2", .default = NA)),
+        PaFiO2_from_raw
+      ),
+      
+      SpFiO2 = dplyr::coalesce(
+        num0(pluck0(cl, "SpO2_FiO2", .default = NA)),
+        SpFiO2_from_raw
+      ),
       
       # клетки крови
       leucocytes   = num0(pluck0(kc, "лейкоциты", .default = NA)),
@@ -1073,6 +1126,18 @@ HA_tidy <- HA_tidy %>%
   ) %>%
   # Аналогично: оставляем только parsed-вариант даты старта (HA_start_dt)
   select(-any_of("HA_start_datetime"))
+
+# Время от поступления в ОРИТ до начала антибиотикотерапии, часы.
+# Отрицательные значения допустимы: антибиотики могли начаться до поступления в ОРИТ.
+if (all(c("ICU_in_dt", "antibiotics_start_dt") %in% names(patients_tidy))) {
+  patients_tidy <- patients_tidy %>%
+    mutate(
+      ICU_to_antibiotics_dt = round(
+        as.numeric(difftime(antibiotics_start_dt, ICU_in_dt, units = "hours")),
+        1
+      )
+    )
+}
 
 # 10. Postprocess: simple derived variables -------------------------------
 
@@ -1336,6 +1401,20 @@ patients_tidy <- patients_tidy %>%
     is_lps_72h = coalesce(as.integer(is_lps_72h), 0L)
   )
 
+# Время от начала антибиотикотерапии до первой «Гемоперфузии 1», часы.
+# Отрицательные значения допустимы: первая сорбция могла начаться до антибиотиков.
+if (all(c("antibiotics_start_dt", "first_sorption_dt") %in% names(patients_tidy))) {
+  patients_tidy <- patients_tidy %>%
+    mutate(
+      antibiotics_to_HA1_hours = round(
+        as.numeric(difftime(first_sorption_dt, antibiotics_start_dt, units = "hours")),
+        1
+      )
+    )
+} else {
+  patients_tidy$antibiotics_to_HA1_hours <- NA_real_
+}
+
 # 12b. Manual diagnosis/indication review --------------------------------
 
 # Для записей из старой формы без checkbox-структуры подставляем ручную разметку
@@ -1411,6 +1490,58 @@ if (all(c("SOFA", "status") %in% names(patients_tidy))) {
     )
 }
 
+# SIC score (Sepsis-Induced Coagulopathy), 0–6 баллов:
+# - тромбоциты: >=150 = 0; 100–<150 = 1; <100 = 2 (×10^9/л);
+# - INR: <=1.2 = 0; >1.2–<=1.4 = 1; >1.4 = 2;
+# - SOFA: 0 = 0; 1 = 1; >=2 = 2.
+#
+# SIC_positive: 1, если SIC_score >= 4 и сумма суббаллов тромбоцитов + INR >= 3;
+# 0, если все три компонента известны, но критерии не выполнены; NA при отсутствии
+# хотя бы одного компонента.
+#
+# В оригинальных критериях SIC используется сумма 4 органных компонентов SOFA
+# (дыхательный, печёночный, сердечно-сосудистый и почечный), а не общий SOFA.
+# В текущем реестре доступен только общий SOFA, поэтому здесь он используется как
+# прагматичная замена, с ограничением вклада до 2 баллов. SIC_score и SIC_positive
+# не следует интерпретировать как строго формальную верификацию SIC без компонент SOFA.
+if (all(c("thrombocytes", "INR", "SOFA") %in% names(patients_tidy))) {
+  patients_tidy <- patients_tidy %>%
+    dplyr::mutate(
+      .SIC_platelets = dplyr::case_when(
+        thrombocytes < 100 ~ 2,
+        thrombocytes >= 100 & thrombocytes < 150 ~ 1,
+        thrombocytes >= 150 ~ 0,
+        TRUE ~ NA_real_
+      ),
+      .SIC_INR = dplyr::case_when(
+        INR > 1.4 ~ 2,
+        INR > 1.2 & INR <= 1.4 ~ 1,
+        INR <= 1.2 ~ 0,
+        TRUE ~ NA_real_
+      ),
+      .SIC_SOFA = dplyr::case_when(
+        SOFA >= 2 ~ 2,
+        SOFA == 1 ~ 1,
+        SOFA == 0 ~ 0,
+        TRUE ~ NA_real_
+      ),
+      SIC_score = dplyr::if_else(
+        !is.na(.SIC_platelets) & !is.na(.SIC_INR) & !is.na(.SIC_SOFA),
+        .SIC_platelets + .SIC_INR + .SIC_SOFA,
+        NA_real_
+      ),
+      SIC_positive = dplyr::case_when(
+        is.na(.SIC_platelets) | is.na(.SIC_INR) | is.na(.SIC_SOFA) ~ NA_real_,
+        SIC_score >= 4 & (.SIC_platelets + .SIC_INR) >= 3 ~ 1,
+        TRUE ~ 0
+      )
+    ) %>%
+    dplyr::select(-.SIC_platelets, -.SIC_INR, -.SIC_SOFA)
+} else {
+  patients_tidy$SIC_score <- NA_real_
+  patients_tidy$SIC_positive <- NA_real_
+}
+
 # Единая колонка бактериальной флоры по грам-окраске + бинарные индикаторы по каждому посеву:
 if (all(c("pat_gram_positive", "pat_gram_negative") %in% names(patients_tidy))) {
   patients_tidy <- patients_tidy %>%
@@ -1457,6 +1588,311 @@ if (all(c("pat_record_id", "HA_indications") %in% names(patients_tidy))) {
       )
     ) %>%
     dplyr::select(-.septic_pct)
+}
+
+
+# 13b. Baseline severity ranks from Google Dictionary ----------------------
+
+# Ранги становятся частью patients_tidy:
+# - правила читаются из Google-листа Dictionary;
+# - используются только строки: causal_type = baseline, data_type = numeric/binary/factor,
+#   `Включать в baseline_rank_vars` = "Да";
+# - numeric: ранг по расстоянию от референсного центра или диапазона;
+# - binary/factor: референсный уровень = 0, любой другой клинически интерпретируемый уровень = 1;
+# - расчет выполняется на baseline_timepoint_for_ranks, затем *_rank присоединяются
+#   ко всем строкам пациента в long patients_tidy.
+
+if (isTRUE(build_baseline_ranks)) {
+  required_rank_cols <- c("pat_record_id", "timepoint")
+  missing_rank_cols <- setdiff(required_rank_cols, names(patients_tidy))
+  if (length(missing_rank_cols) > 0) {
+    stop("Для расчета baseline ranks в patients_tidy нет колонок: ",
+         paste(missing_rank_cols, collapse = ", "))
+  }
+  
+  clean_text_rank <- function(x) {
+    x <- as.character(x)
+    x <- stringr::str_replace_all(x, "\\u00A0", " ")
+    x <- stringr::str_squish(x)
+    x[x == ""] <- NA_character_
+    x
+  }
+  
+  clean_choice_rank <- function(x) {
+    stringr::str_to_lower(clean_text_rank(x))
+  }
+  
+  normalise_category_rank <- function(x) {
+    x <- clean_choice_rank(x)
+    # В референсной ячейке допускаем комментарий в скобках после уровня.
+    # Например: "ж (если используется как ковариата)" -> "ж".
+    x <- sub("\\s*\\(.*$", "", x)
+    stringr::str_squish(x)
+  }
+  
+  normalise_reference_levels_rank <- function(x) {
+    x <- normalise_category_rank(x)
+    if (length(x) != 1L || is.na(x) || !nzchar(x)) return(NA_character_)
+    levels <- trimws(strsplit(x, "|", fixed = TRUE)[[1]])
+    levels <- levels[nzchar(levels)]
+    if (length(levels) == 0L) return(NA_character_)
+    paste(unique(levels), collapse = "|")
+  }
+  
+  is_reference_level_rank <- function(value, reference_levels) {
+    if (length(value) != 1L || length(reference_levels) != 1L ||
+        is.na(value) || is.na(reference_levels)) {
+      return(FALSE)
+    }
+    value %in% strsplit(reference_levels, "|", fixed = TRUE)[[1]]
+  }
+  
+  is_nonclinical_category_rank <- function(value) {
+    value %in% c(
+      "n/a", "na", "неизвестно", "нет данных",
+      "не оценивалось", "не оценивалось/нет данных",
+      "посев не проводился", "unknown", "missing"
+    )
+  }
+  
+  parse_numeric_reference_rank <- function(x) {
+    empty_rule <- function() {
+      tibble::tibble(
+        rule_type = NA_character_,
+        lower_optimum = NA_real_,
+        upper_optimum = NA_real_,
+        optimal_center = NA_real_
+      )
+    }
+    
+    x <- clean_text_rank(x)
+    if (length(x) != 1L || is.na(x) || !nzchar(x)) return(empty_rule())
+    
+    x <- stringr::str_replace_all(x, ",", ".")
+    numbers_text <- regmatches(
+      x,
+      gregexpr("\\d+(?:\\.\\d+)?", x, perl = TRUE)
+    )[[1]]
+    if (length(numbers_text) == 0L) return(empty_rule())
+    
+    numbers <- suppressWarnings(as.numeric(numbers_text))
+    numbers <- numbers[!is.na(numbers)]
+    
+    if (length(numbers) == 1L) {
+      return(tibble::tibble(
+        rule_type = "center",
+        lower_optimum = NA_real_,
+        upper_optimum = NA_real_,
+        optimal_center = numbers[1]
+      ))
+    }
+    
+    if (length(numbers) == 2L) {
+      return(tibble::tibble(
+        rule_type = "interval",
+        lower_optimum = min(numbers),
+        upper_optimum = max(numbers),
+        optimal_center = NA_real_
+      ))
+    }
+    
+    empty_rule()
+  }
+  
+  options(gargle_oauth_cache = TRUE)
+  googlesheets4::gs4_auth(email = TRUE, scopes = "spreadsheets.readonly")
+  
+  dictionary_raw <- googlesheets4::read_sheet(
+    ss = dictionary_url,
+    sheet = dictionary_sheet,
+    na = c("", "NA", "N/A")
+  )
+  
+  required_dictionary_columns <- c(
+    "Название",
+    "Имя переменной",
+    "Тип переменной",
+    "Казуальный тип",
+    "Включать в baseline_rank_vars",
+    "Единица в датасете",
+    "Референсный уровень / уровень наименьшего риска"
+  )
+  
+  missing_dictionary_columns <- setdiff(required_dictionary_columns, names(dictionary_raw))
+  if (length(missing_dictionary_columns) > 0) {
+    stop("В Google Dictionary отсутствуют колонки: ",
+         paste(missing_dictionary_columns, collapse = ", "))
+  }
+  
+  baseline_candidates <- dictionary_raw %>%
+    dplyr::transmute(
+      variable = clean_text_rank(.data[["Имя переменной"]]),
+      label = clean_text_rank(.data[["Название"]]),
+      data_type = clean_choice_rank(.data[["Тип переменной"]]),
+      causal_type = clean_choice_rank(.data[["Казуальный тип"]]),
+      rank_flag = clean_choice_rank(.data[["Включать в baseline_rank_vars"]]),
+      unit = clean_text_rank(.data[["Единица в датасете"]]),
+      optimum_reference = clean_text_rank(
+        .data[["Референсный уровень / уровень наименьшего риска"]]
+      )
+    ) %>%
+    dplyr::filter(
+      causal_type == "baseline",
+      data_type %in% c("numeric", "binary", "factor"),
+      rank_flag == "да",
+      !is.na(variable)
+    )
+  
+  if (nrow(baseline_candidates) == 0L) {
+    stop("В Dictionary нет baseline-переменных с `Включать в baseline_rank_vars = Да`.")
+  }
+  
+  if (anyDuplicated(baseline_candidates$variable) > 0L) {
+    stop(
+      "В Dictionary есть дублирующиеся baseline rank rules для: ",
+      paste(unique(baseline_candidates$variable[duplicated(baseline_candidates$variable)]), collapse = ", ")
+    )
+  }
+  
+  numeric_rules <- dplyr::bind_rows(
+    lapply(baseline_candidates$optimum_reference, parse_numeric_reference_rank)
+  )
+  
+  rank_rules <- baseline_candidates %>%
+    dplyr::bind_cols(numeric_rules) %>%
+    dplyr::mutate(
+      reference_levels = vapply(
+        optimum_reference,
+        normalise_reference_levels_rank,
+        character(1)
+      ),
+      rule_type = dplyr::case_when(
+        data_type == "numeric" ~ rule_type,
+        data_type %in% c("binary", "factor") & !is.na(reference_levels) ~ "reference_level",
+        TRUE ~ NA_character_
+      ),
+      variable_exists = variable %in% names(patients_tidy)
+    )
+  
+  invalid_rank_rules <- rank_rules %>%
+    dplyr::filter(!variable_exists | is.na(rule_type))
+  if (nrow(invalid_rank_rules) > 0L) {
+    stop(
+      "Проверьте ранжируемые переменные в Dictionary: ",
+      paste(
+        paste0(
+          invalid_rank_rules$variable,
+          " [reference: ",
+          dplyr::coalesce(invalid_rank_rules$optimum_reference, "<пусто>"),
+          "; exists: ", invalid_rank_rules$variable_exists, "]"
+        ),
+        collapse = ", "
+      )
+    )
+  }
+  
+  mandatory_rank_vars <- c("SOFA", "VIS2020")
+  missing_mandatory_ranks <- setdiff(mandatory_rank_vars, rank_rules$variable)
+  if (length(missing_mandatory_ranks) > 0L) {
+    stop(
+      "SOFA и VIS2020 должны быть включены в baseline ranks. В Dictionary не хватает: ",
+      paste(missing_mandatory_ranks, collapse = ", ")
+    )
+  }
+  
+  mandatory_bad_reference <- rank_rules %>%
+    dplyr::filter(variable %in% mandatory_rank_vars) %>%
+    dplyr::filter(data_type != "numeric" | optimum_reference != "0" | rule_type != "center")
+  if (nrow(mandatory_bad_reference) > 0L) {
+    stop("Для SOFA и VIS2020 ожидается numeric reference = 0 в Dictionary.")
+  }
+  
+  patients_baseline_for_ranks <- patients_tidy %>%
+    dplyr::filter(timepoint == baseline_timepoint_for_ranks, !is.na(pat_record_id))
+  
+  if (nrow(patients_baseline_for_ranks) == 0L) {
+    stop("Нет строк patients_tidy с timepoint == ", baseline_timepoint_for_ranks)
+  }
+  
+  duplicate_rank_ids <- patients_baseline_for_ranks %>%
+    dplyr::count(pat_record_id, name = "n_rows") %>%
+    dplyr::filter(n_rows > 1L)
+  if (nrow(duplicate_rank_ids) > 0L) {
+    stop(
+      "Для рангов найдено более одной baseline-строки на пациента. Примеры ID: ",
+      paste(head(duplicate_rank_ids$pat_record_id, 10L), collapse = ", ")
+    )
+  }
+  
+  baseline_rank_long <- patients_baseline_for_ranks %>%
+    dplyr::select(pat_record_id, dplyr::all_of(rank_rules$variable)) %>%
+    tidyr::pivot_longer(
+      cols = -pat_record_id,
+      names_to = "variable",
+      values_to = "value",
+
+      # Ранжируем одновременно numeric, binary и factor variables.
+      # Поэтому приводим значения к общему текстовому типу здесь; ниже
+      # numeric variables отдельно конвертируются в numeric_value.
+      values_transform = list(value = as.character)
+    ) %>%
+    dplyr::left_join(rank_rules, by = "variable") %>%
+    dplyr::mutate(
+      numeric_value = suppressWarnings(as.numeric(as.character(value))),
+      category_value = normalise_category_rank(value),
+      category_is_nonclinical = is_nonclinical_category_rank(category_value),
+      category_is_reference = mapply(
+        is_reference_level_rank,
+        category_value,
+        reference_levels
+      ),
+      distance_to_optimum = dplyr::case_when(
+        data_type == "numeric" & is.na(numeric_value) ~ NA_real_,
+        data_type == "numeric" & rule_type == "interval" ~
+          pmax(lower_optimum - numeric_value, numeric_value - upper_optimum, 0),
+        data_type == "numeric" & rule_type == "center" ~
+          abs(numeric_value - optimal_center),
+        data_type %in% c("binary", "factor") &
+          (is.na(category_value) | category_is_nonclinical) ~ NA_real_,
+        data_type %in% c("binary", "factor") & category_is_reference ~ 0,
+        data_type %in% c("binary", "factor") ~ 1
+      )
+    ) %>%
+    dplyr::group_by(variable) %>%
+    dplyr::mutate(
+      severity_rank = dplyr::case_when(
+        is.na(distance_to_optimum) ~ NA_integer_,
+        distance_to_optimum == 0 ~ 0L,
+        TRUE ~ dplyr::dense_rank(dplyr::if_else(
+          distance_to_optimum > 0,
+          distance_to_optimum,
+          NA_real_
+        ))
+      )
+    ) %>%
+    dplyr::ungroup()
+  
+  baseline_rank_wide <- baseline_rank_long %>%
+    dplyr::select(pat_record_id, variable, severity_rank) %>%
+    tidyr::pivot_wider(
+      names_from = variable,
+      values_from = severity_rank,
+      names_glue = "{variable}_rank"
+    )
+  
+  # Если скрипт перезапускается в текущей R-сессии, сначала удаляем старые *_rank,
+  # чтобы не оставить устаревшие колонки при изменении Dictionary.
+  old_rank_cols <- grep("_rank$", names(patients_tidy), value = TRUE)
+  if (length(old_rank_cols) > 0) {
+    patients_tidy <- patients_tidy %>% dplyr::select(-dplyr::all_of(old_rank_cols))
+  }
+  
+  patients_tidy <- patients_tidy %>%
+    dplyr::left_join(baseline_rank_wide, by = "pat_record_id")
+  
+  cat("\nBaseline ranks added to patients_tidy:",
+      ncol(baseline_rank_wide) - 1L, "variables\n")
+  cat("Rank variables:", paste(rank_rules$variable, collapse = ", "), "\n")
 }
 
 # 14. QA ------------------------------------------------------------------
@@ -1530,9 +1966,14 @@ qc_missing_pat <- tibble::tibble(
   variable = c(
     "ICU_in_dt",
     "ICU_out_or_death_dt",
+    "antibiotics_start_dt",
+    "ICU_to_antibiotics_dt",
+    "antibiotics_to_HA1_hours",
     "first_sorption_dt",
     "status",
     "INR",
+    "SIC_score",
+    "SIC_positive",
     "PaFiO2",
     "SpFiO2",
     "PaFiO2_calc"
@@ -1540,9 +1981,14 @@ qc_missing_pat <- tibble::tibble(
   n_missing = c(
     count_na_col(patients_tidy, "ICU_in_dt"),
     count_na_col(patients_tidy, "ICU_out_or_death_dt"),
+    count_na_col(patients_tidy, "antibiotics_start_dt"),
+    count_na_col(patients_tidy, "ICU_to_antibiotics_dt"),
+    count_na_col(patients_tidy, "antibiotics_to_HA1_hours"),
     count_na_col(patients_tidy, "first_sorption_dt"),
     count_na_col(patients_tidy, "status"),
     count_na_col(patients_tidy, "INR"),
+    count_na_col(patients_tidy, "SIC_score"),
+    count_na_col(patients_tidy, "SIC_positive"),
     count_na_col(patients_tidy, "PaFiO2"),
     count_na_col(patients_tidy, "SpFiO2"),
     count_na_col(patients_tidy, "PaFiO2_calc")

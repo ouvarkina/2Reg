@@ -24,6 +24,7 @@ execute:
 
 #| label: setup
 #| include: false
+#| cache: false
 
 suppressPackageStartupMessages({
   library(readxl)
@@ -85,6 +86,13 @@ if (is.na(diag_file)) diag_file <- NA_character_
 
 patients_tidy <- readRDS(patients_rds)
 HA_tidy       <- readRDS(ha_rds)
+
+# При обновлении RDS/словаря пересчитываем кэшированные аналитические чанки.
+data_cache_key <- paste(
+  file.info(c(patients_rds, ha_rds, dict_file))$mtime,
+  collapse = "_"
+)
+knitr::opts_chunk$set(cache.extra = data_cache_key)
 
 # Убираем переведенных из других ОРИТ, TRUE/FALSE
 exclude_other_icu_transfer <- FALSE
@@ -217,6 +225,19 @@ pt_top <- patients_tidy %>%
     vasopressors_if_used = factor(vasopressors_if_used, levels = c("Да","Нет"))
   )
 
+# SIC_positive храним в ETL как 0/1/NA, а для descriptive-таблиц выводим как Да/Нет.
+if ("SIC_positive" %in% names(pt_top)) {
+  pt_top <- pt_top %>%
+    mutate(
+      SIC_positive = case_when(
+        SIC_positive == 1 ~ "Да",
+        SIC_positive == 0 ~ "Нет",
+        TRUE ~ NA_character_
+      ) %>%
+        factor(levels = c("Да", "Нет"))
+    )
+}
+
 if (isTRUE(show_antibiotics) && "antibiotics_start_dt" %in% names(pt_top)) {
   pt_top <- pt_top %>%
     mutate(
@@ -287,6 +308,8 @@ pt_top <- pt_top %>%
 vars_top <- c(
   "age_yr","sex","BMI","ICU_6_month_history","from_other_ICU_transfer",
   "icu_to_HA1_hours",
+  "ICU_to_antibiotics_dt",
+  "antibiotics_to_HA1_hours",
   "vasopressors_if_used","RRT_if_used","MV_if_used",
   "charlson_index",
   "pat_bacteremia","pat_gram_stain","pat_fungal",
@@ -301,6 +324,8 @@ lbl_top <- list(
   ICU_6_month_history = ru_or("ICU_6_month_history"),
   from_other_ICU_transfer = ru_or("from_other_ICU_transfer"),
   icu_to_HA1_hours = "Время между поступлением в ОРИТ и началом ГС, ч",
+  ICU_to_antibiotics_dt = "Время от поступления в ОРИТ до начала АБ-терапии, ч",
+  antibiotics_to_HA1_hours = "Время от начала АБ-терапии до первой ГС, ч",
   vasopressors_if_used = "Потребность в вазопрессорах",
   RRT_if_used = "Потребность в ЗПТ",
   MV_if_used  = "Потребность в ИВЛ",
@@ -401,6 +426,18 @@ pt_bottom <- patients_tidy %>%
   mutate(timepoint = factor(timepoint, levels = tps_bottom)) %>%
   distinct(pat_record_id, timepoint, .keep_all = TRUE)
 
+if ("SIC_positive" %in% names(pt_bottom)) {
+  pt_bottom <- pt_bottom %>%
+    mutate(
+      SIC_positive = case_when(
+        SIC_positive == 1 ~ "Да",
+        SIC_positive == 0 ~ "Нет",
+        TRUE ~ NA_character_
+      ) %>%
+        factor(levels = c("Да", "Нет"))
+    )
+}
+
 u_lactate <- unit_mode(pt_bottom$lactate_unit)
 u_creat   <- unit_mode(pt_bottom$creatinine_unit)
 u_albumin <- unit_mode(pt_bottom$albumin_unit)
@@ -408,12 +445,14 @@ u_crp     <- unit_mode(pt_bottom$C_react_protein_unit)
 u_pct     <- unit_mode(pt_bottom$procalcitonin_unit)
 u_ddimer  <- unit_mode(pt_bottom$D_dimer_unit)
 u_fibr    <- unit_mode(pt_bottom$fibrinogen_unit)
+u_bili    <- unit_mode(pt_bottom$bilirubin_total_unit)
 
 vars_bottom <- c(
-  "SOFA","VIS2020","PaFiO2_calc",
-  "lactate","creatinine","albumin","C_react_protein",
-  "procalcitonin","D_dimer","fibrinogen",
-  "leucocytes","lymphocytes","neutrophils","NLR",
+  "SOFA", "VIS2020", "PaFiO2_calc",
+  "INR", "SIC_score", "SIC_positive",
+  "lactate", "creatinine", "albumin", "C_react_protein",
+  "procalcitonin", "D_dimer", "fibrinogen", "bilirubin_total",
+  "leucocytes", "lymphocytes", "neutrophils", "NLR",
   "thrombocytes"
 )
 
@@ -421,6 +460,9 @@ lbl_bottom <- list(
   SOFA = ru_or("SOFA"),
   VIS2020 = ru_or("VIS2020"),
   PaFiO2_calc = paste0(ru_or("PaFiO2"), " (расч. по SpFiO2)"),
+  INR = "МНО",
+  SIC_score = "Индекс SIC, баллы",
+  SIC_positive = "SIC-положительный статус",
   lactate = lab_u(ru_or("lactate"), u_lactate),
   creatinine = lab_u(ru_or("creatinine"), u_creat),
   albumin = lab_u(ru_or("albumin"), u_albumin),
@@ -428,6 +470,7 @@ lbl_bottom <- list(
   procalcitonin = lab_u(ru_or("procalcitonin"), u_pct),
   D_dimer = lab_u(ru_or("D_dimer"), u_ddimer),
   fibrinogen = lab_u(ru_or("fibrinogen"), u_fibr),
+  bilirubin_total = lab_u(ru_or("bilirubin_total"), u_bili),
   leucocytes = ru_or("leucocytes"),
   lymphocytes = ru_or("lymphocytes"),
   neutrophils = ru_or("neutrophils"),
@@ -440,7 +483,12 @@ tbl_bottom <- pt_bottom %>%
   select(timepoint, any_of(vars_bottom)) %>%
   tbl_summary(
     by = timepoint,
-    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})"),
+    type = list(any_of("SIC_positive") ~ "dichotomous"),
+    value = list(any_of("SIC_positive") ~ "Да"),
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{p}% ({n})"
+    ),
     digits = list(NLR ~ 2),
     label = lbl_bottom,
     missing = "no"
@@ -666,10 +714,13 @@ ha_first_corr <- ha_corr_src %>%
       TRUE ~ NA_character_
     ),
 
-    HA_anticoag_citrate = as.integer(HA_anticoagulation_corr == "Цитрат"),
-    HA_anticoag_heparin = as.integer(HA_anticoagulation_corr == "Гепарин"),
-    HA_anticoag_none = as.integer(HA_anticoagulation_corr == "Без антикоагуляции"),
-    HA_anticoag_other = as.integer(HA_anticoagulation_corr == "Другое"),
+    # Для коррелограммы антикоагуляцию кодируем бинарно:
+    # 1 = гепарин, 0 = любой другой известный вариант антикоагуляции.
+    HA_anticoag_heparin = case_when(
+      HA_anticoagulation_corr == "Гепарин" ~ 1,
+      !is.na(HA_anticoagulation_corr) ~ 0,
+      TRUE ~ NA_real_
+    ),
 
     first_sorption_LPS = case_when(
       str_detect(str_to_upper(HA_cartrige_type_std), "LPS") ~ 1,
@@ -685,10 +736,7 @@ ha_first_corr <- ha_corr_src %>%
     HA1_start_datetime,
     any_of(c("HA_duration", "HA_avg_blood_flow")),
     first_sorption_LPS,
-    HA_anticoag_citrate,
     HA_anticoag_heparin,
-    HA_anticoag_none,
-    HA_anticoag_other,
     HA_other_methods_bin,
     HA_adverse_effects_bin
   )
@@ -779,9 +827,17 @@ corr_t0 <- corr_t0 %>%
   add_optional_bin("is_septic_bin", c("is_septic")) %>%
   add_optional_bin("ECMO_if_used_bin", c("ECMO_if_used", "ECMO_required")) %>%
   add_optional_bin("is_lps_72h", c("is_lps_72h")) %>%
+  add_optional_numeric("INR", c("INR", "МНО", "mno")) %>%
   add_optional_numeric("avg_BP", c("avg_BP", "mean_BP", "MAP")) %>%
   add_optional_numeric("PaFiO2", c("PaFiO2")) %>%
   add_optional_numeric("SpFiO2", c("SpFiO2")) %>%
+  add_optional_numeric("ICU_to_antibiotics_dt", c("ICU_to_antibiotics_dt")) %>%
+  add_optional_numeric(
+    "antibiotics_to_HA1_hours",
+    c("antibiotics_to_HA1_hours", "antibiotics_to_first_HA1_hours")
+  ) %>%
+  add_optional_numeric("SIC_score", c("SIC_score")) %>%
+  add_optional_bin("SIC_positive", c("SIC_positive")) %>%
   add_optional_numeric(
     "vasopressors_dur_hours",
     c("vasopressors_dur_hours", "vasopressors_duration_hours", "vasopressors_duration_h", "vasopressors_duration")
@@ -947,7 +1003,8 @@ corr_full <- corr_full %>%
         "is_septic_bin",
         "ECMO_if_used_bin",
         "is_lps_72h",
-        "first_sorption_LPS"
+        "first_sorption_LPS",
+        "SIC_positive"
       )),
       as.numeric
     )
@@ -964,6 +1021,9 @@ corr_vars <- c(
   # клиника на T0
   "SOFA",
   "VIS2020_0_excl",
+  "INR",
+  "SIC_score",
+  "SIC_positive",
   "PaFiO2_calc",
   "PaFiO2",
   "SpFiO2",
@@ -978,6 +1038,7 @@ corr_vars <- c(
   "RRT_dur_hours",
   "MV_dur_hours",
   "ECMO_dur_hours",
+  "ICU_to_antibiotics_dt",
 
   # посевы
   culture_vars,
@@ -1003,14 +1064,12 @@ corr_vars <- c(
 
   # время и сорбция
   "icu_to_HA1_hours",
+  "antibiotics_to_HA1_hours",
   "HA_duration",
   "HA_avg_blood_flow",
   "first_sorption_LPS",
   "is_lps_72h",
-  "HA_anticoag_citrate",
   "HA_anticoag_heparin",
-  "HA_anticoag_none",
-  "HA_anticoag_other",
   "HA_other_methods_bin",
   "HA_adverse_effects_bin",
   "HA_efficency_CGI_E",
@@ -1246,6 +1305,9 @@ corr_label_map <- c(
   # клиника T0
   SOFA = "SOFA",
   VIS2020_0_excl = "VIS",
+  INR = "INR",
+  SIC_score = "SIC_score",
+  SIC_positive = "SIC_positive",
   PaFiO2_calc = "PF_ratio",
   PaFiO2 = "PaFiO2",
   SpFiO2 = "SpFiO2",
@@ -1260,6 +1322,7 @@ corr_label_map <- c(
   RRT_dur_hours = "RRT_dur_h",
   MV_dur_hours = "MV_dur_h",
   ECMO_dur_hours = "ECMO_dur_h",
+  ICU_to_antibiotics_dt = "ICU_to_AB_h",
 
   # посевы
   culture_gram_plus_bin = "cult_Gram_plus",
@@ -1284,14 +1347,12 @@ corr_label_map <- c(
 
   # сорбция
   icu_to_HA1_hours = "ICU_to_HA_h",
+  antibiotics_to_HA1_hours = "AB_to_HA_h",
   HA_duration = "HA_duration",
   HA_avg_blood_flow = "blood_flow",
   first_sorption_LPS = "first_LPS",
   is_lps_72h = "LPS_72h",
-  HA_anticoag_citrate = "AC_citrate",
-  HA_anticoag_heparin = "AC_heparin",
-  HA_anticoag_none = "AC_none",
-  HA_anticoag_other = "AC_other",
+  HA_anticoag_heparin = "Heparin",
   HA_other_methods_bin = "other_ECM",
   HA_adverse_effects_bin = "AE_HA",
   HA_efficency_CGI_E = "CGI_E",
@@ -1369,6 +1430,9 @@ block_vars <- list(
   clinical = c(
     "SOFA",
     "VIS",
+    "INR",
+    "SIC_score",
+    "SIC_positive",
     "PF_ratio",
     "PaFiO2",
     "SpFiO2",
@@ -1382,7 +1446,8 @@ block_vars <- list(
     "Vaso_dur_h",
     "RRT_dur_h",
     "MV_dur_h",
-    "ECMO_dur_h"
+    "ECMO_dur_h",
+    "ICU_to_AB_h"
   ),
 
   cultures = c(
@@ -1413,14 +1478,12 @@ block_vars <- list(
 
   sorption = c(
     "ICU_to_HA_h",
+    "AB_to_HA_h",
     "HA_duration",
     "blood_flow",
     "first_LPS",
     "LPS_72h",
-    "AC_citrate",
-    "AC_heparin",
-    "AC_none",
-    "AC_other",
+    "Heparin",
     "other_ECM",
     "AE_HA",
     "CGI_E"
@@ -1476,36 +1539,145 @@ col_pal <- colorRampPalette(c("blue", "white", "red"))(200)
 
 # функция
 
-plot_corr_full <- function(M_plot, P_plot, title = NULL, tl_cex = 0.45, pch_cex = 0.45) {
-  par(mar = c(1, 1, 4, 2))
+plot_corr_tiles <- function(
+  M_plot,
+  P_plot = NULL,
+  title = NULL,
+  show_stars = TRUE,
+  show_diagonal = TRUE,
+  text_size = 2.4,
+  coef_size = 2.8
+) {
+  stopifnot(identical(rownames(M_plot), colnames(M_plot)))
 
-  corrplot(
-    M_plot,
-    method = "color",
-    type = "full",
-    diag = TRUE,
-    order = "original",
+  vars <- colnames(M_plot)
 
-    col = col_pal,
-    cl.lim = c(-1, 1),
+  cor_df <- as.data.frame(as.table(M_plot), stringsAsFactors = FALSE) %>%
+    rename(
+      var_y = Var1,
+      var_x = Var2,
+      rho = Freq
+    ) %>%
+    mutate(
+      var_x = factor(var_x, levels = vars),
+      var_y = factor(var_y, levels = rev(vars))
+    )
 
-    tl.pos = "lt",
-    tl.col = "brown4",
-    tl.cex = tl_cex,
-    tl.srt = 90,
+  if (!is.null(P_plot)) {
+    p_df <- as.data.frame(as.table(P_plot), stringsAsFactors = FALSE) %>%
+      rename(
+        var_y = Var1,
+        var_x = Var2,
+        p = Freq
+      )
 
-    addgrid.col = "grey85",
-    na.label = " ",
+    cor_df <- cor_df %>%
+      left_join(p_df, by = c("var_y", "var_x"))
+  } else {
+    cor_df <- cor_df %>%
+      mutate(p = NA_real_)
+  }
 
-    p.mat = P_plot,
-    sig.level = c(0.001, 0.01, 0.05),
-    insig = "label_sig",
-    pch.col = "black",
-    pch.cex = pch_cex,
+  cor_df <- cor_df %>%
+    mutate(
+      is_diag = as.character(var_x) == as.character(var_y),
 
-    title = title,
-    mar = c(0, 0, 2, 0)
-  )
+      stars = case_when(
+        is.na(p) ~ "",
+        p <= 0.001 ~ "***",
+        p <= 0.01 ~ "**",
+        p <= 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+
+      rho_lab = if_else(
+        is.na(rho),
+        "",
+        sprintf("%.2f", rho)
+      ),
+
+      label_pair = case_when(
+        is.na(rho) ~ "",
+        is_diag & show_diagonal ~ paste0(as.character(var_x), "\n—"),
+        is_diag & !show_diagonal ~ "",
+        TRUE ~ paste0(
+          as.character(var_y),
+          "\nvs\n",
+          as.character(var_x)
+        )
+      ),
+
+      label_coef = case_when(
+        is.na(rho) ~ "",
+        is_diag ~ "",
+        show_stars ~ paste0(rho_lab, stars),
+        TRUE ~ rho_lab
+      )
+    )
+
+  ggplot(cor_df, aes(x = var_x, y = var_y, fill = rho)) +
+    geom_tile(color = "grey25", linewidth = 0.25) +
+
+    geom_text(
+      aes(label = label_pair),
+      size = text_size,
+      lineheight = 0.85,
+      color = "grey90"
+    ) +
+
+    geom_text(
+      aes(label = label_coef),
+      size = coef_size,
+      fontface = "bold",
+      color = "white",
+      nudge_y = -0.25
+    ) +
+
+    scale_fill_gradient2(
+      low = "blue",
+      mid = "grey20",
+      high = "red",
+      midpoint = 0,
+      limits = c(-1, 1),
+      na.value = "grey10",
+      name = expression(rho)
+    ) +
+
+    coord_fixed() +
+
+    labs(
+      title = title,
+      x = NULL,
+      y = NULL
+    ) +
+
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.background = element_rect(fill = "grey10", color = NA),
+      panel.background = element_rect(fill = "grey10", color = NA),
+      panel.grid = element_blank(),
+
+      axis.text.x = element_text(
+        angle = 0,
+        hjust = 0.5,
+        vjust = 0.5,
+        color = "grey85",
+        size = 9
+      ),
+      axis.text.y = element_text(
+        color = "grey85",
+        size = 9
+      ),
+
+      plot.title = element_text(
+        color = "grey95",
+        face = "bold",
+        hjust = 0.5
+      ),
+
+      legend.text = element_text(color = "grey85"),
+      legend.title = element_text(color = "grey85")
+    )
 }
 
 ```
@@ -1602,7 +1774,7 @@ dev.off()
 #| message: false
 #| warning: false
  
-# Partial Spearman correlation adjusted for SOFA -------------------------
+# Partial Spearman adjusted for SOFA --------------------------------------
 
 partial_spearman_matrix_safe <- function(x, control_var = "SOFA", min_n = 5) {
   x <- as.data.frame(x)
@@ -1700,46 +1872,109 @@ partial_spearman_matrix_safe <- function(x, control_var = "SOFA", min_n = 5) {
   list(r = r, p = p)
 }
 
+prep_p_for_corrplot <- function(P, M) {
+  P_plot <- P
+
+  # Если корреляция не рассчитана, p-value тоже должен быть NA
+  P_plot[is.na(M)] <- NA
+
+  # Если корреляция есть, но p-value не рассчитался — считаем как незначимое
+  P_plot[is.na(P_plot) & !is.na(M)] <- 1
+
+  P_plot
+}
+
+# Считаем partial Spearman -------------------------------------------------
+
+control_var <- "SOFA"
+
 partial_sofa <- partial_spearman_matrix_safe(
   corr_numeric_plot,
-  control_var = "SOFA",
+  control_var = control_var,
   min_n = min_pair_n
 )
 
 M_partial_SOFA <- partial_sofa$r
 P_partial_SOFA <- partial_sofa$p
 
-# Совмещенная матрица: низ — обычные корреляции, верх — частные
+# Порядок переменных для смешанной коррелограммы --------------------------
 
-control_var <- "SOFA"
+# Варианты:
+# "hclust_abs"  — полностью hclust по |rho|, сильные + и - связи рядом
+# "hclust_signed" — hclust с учетом знака корреляции
+# "final_order" — использовать заранее созданный блочный порядок final_order
 
-combo_order <- final_order[
-  final_order %in% colnames(M)
+combo_order_method <- "hclust_abs"
+
+if (combo_order_method == "hclust_abs") {
+  M_for_combo_order <- M
+  M_for_combo_order[is.na(M_for_combo_order)] <- 0
+  diag(M_for_combo_order) <- 1
+
+  combo_order <- corrplot::corrMatOrder(
+    abs(M_for_combo_order),
+    order = "hclust",
+    hclust.method = "ward.D2"
+  )
+
+  combo_order <- colnames(M)[combo_order]
+}
+
+if (combo_order_method == "hclust_signed") {
+  M_for_combo_order <- M
+  M_for_combo_order[is.na(M_for_combo_order)] <- 0
+  diag(M_for_combo_order) <- 1
+
+  combo_order <- corrplot::corrMatOrder(
+    M_for_combo_order,
+    order = "hclust",
+    hclust.method = "ward.D2"
+  )
+
+  combo_order <- colnames(M)[combo_order]
+}
+
+if (combo_order_method == "final_order") {
+  if (!exists("final_order")) {
+    stop("Для combo_order_method = 'final_order' нужен объект final_order")
+  }
+
+  combo_order <- final_order[
+    final_order %in% colnames(M)
+  ]
+}
+
+# На всякий случай оставляем только переменные, которые есть и в M, и в P
+combo_order <- combo_order[
+  combo_order %in% colnames(M) &
+    combo_order %in% colnames(P)
 ]
 
-# Обычные корреляции: полный порядок, включая SOFA
+# Собираем смешанную матрицу ----------------------------------------------
+
+# Нижний треугольник = обычный Spearman, включая SOFA
 M_raw_combo <- M[combo_order, combo_order]
 P_raw_combo <- P[combo_order, combo_order]
 
-# Начинаем с обычной матрицы, но верхний треугольник временно очищаем
 M_combo_SOFA <- M_raw_combo
 P_combo_SOFA <- P_raw_combo
 
+# Верхний треугольник сначала очищаем
 M_combo_SOFA[upper.tri(M_combo_SOFA)] <- NA
 P_combo_SOFA[upper.tri(P_combo_SOFA)] <- NA
 
-# Частные корреляции существуют только для переменных НЕ SOFA
+# Частные корреляции считаются только для переменных НЕ SOFA
 partial_vars <- setdiff(combo_order, control_var)
+
 partial_vars <- partial_vars[
-  partial_vars %in% colnames(M_partial_SOFA)
+  partial_vars %in% colnames(M_partial_SOFA) &
+    partial_vars %in% colnames(P_partial_SOFA)
 ]
 
-M_partial_combo <- M_partial_SOFA[partial_vars, partial_vars]
-P_partial_combo <- P_partial_SOFA[partial_vars, partial_vars]
-
-# Заполняем верхний треугольник частными корреляциями,
-# но только для пар без SOFA
 if (length(partial_vars) >= 2) {
+  M_partial_combo <- M_partial_SOFA[partial_vars, partial_vars, drop = FALSE]
+  P_partial_combo <- P_partial_SOFA[partial_vars, partial_vars, drop = FALSE]
+
   for (i in seq_len(length(partial_vars) - 1)) {
     for (j in (i + 1):length(partial_vars)) {
       v1 <- partial_vars[i]
@@ -1756,20 +1991,242 @@ diag(P_combo_SOFA) <- 0
 
 P_combo_SOFA_plot <- prep_p_for_corrplot(P_combo_SOFA, M_combo_SOFA)
 
-# График
+# Обычный corrplot-вариант -------------------------------------------------
+
+plot_corr_full <- function(
+  M_plot,
+  P_plot,
+  title = NULL,
+  tl_cex = 0.7,
+  pch_cex = 0.5,
+  show_numbers = FALSE,
+  number_cex = 0.3
+) {
+  par(mar = c(1, 1, 4, 2))
+
+  corrplot_args <- list(
+    corr = M_plot,
+    method = "color",
+    type = "full",
+    diag = TRUE,
+    order = "original",
+
+    col = col_pal,
+    cl.lim = c(-1, 1),
+
+    tl.pos = "lt",
+    tl.col = "brown4",
+    tl.cex = tl_cex,
+    tl.srt = 90,
+
+    addgrid.col = "grey85",
+    na.label = " ",
+
+    p.mat = P_plot,
+    sig.level = c(0.001, 0.01, 0.05),
+    insig = "label_sig",
+    pch.col = "black",
+    pch.cex = pch_cex,
+
+    title = title,
+    mar = c(0, 0, 2, 0)
+  )
+
+  if (show_numbers) {
+    corrplot_args$addCoef.col <- "black"
+    corrplot_args$number.cex <- number_cex
+    corrplot_args$number.digits <- 2
+  }
+
+  do.call(corrplot::corrplot, corrplot_args)
+}
 
 plot_corr_full(
   M_combo_SOFA,
   P_combo_SOFA_plot,
   title = "Lower triangle: ordinary Spearman; upper triangle: partial Spearman adjusted for SOFA",
   tl_cex = 0.7,
-  pch_cex = 0.5
+  pch_cex = 0.5,
+  show_numbers = FALSE
 )
 
-# Сохранение в вектор
+# Tile-вариант с подписями внутри клеток ----------------------------------
 
-corr_width  <- max(20, 0.30 * ncol(M_combo_SOFA))
-corr_height <- max(20, 0.30 * ncol(M_combo_SOFA))
+plot_corr_tiles <- function(
+  M_plot,
+  P_plot = NULL,
+  title = NULL,
+  show_stars = TRUE,
+  show_diagonal = TRUE,
+  text_size = 1.3,
+  coef_size = 1.7
+) {
+  stopifnot(identical(rownames(M_plot), colnames(M_plot)))
+
+  vars <- colnames(M_plot)
+
+  cor_df <- as.data.frame(as.table(M_plot), stringsAsFactors = FALSE) %>%
+    rename(
+      var_y = Var1,
+      var_x = Var2,
+      rho = Freq
+    ) %>%
+    mutate(
+      var_x_chr = as.character(var_x),
+      var_y_chr = as.character(var_y),
+      var_x = factor(var_x_chr, levels = vars),
+      var_y = factor(var_y_chr, levels = rev(vars))
+    )
+
+  if (!is.null(P_plot)) {
+    p_df <- as.data.frame(as.table(P_plot), stringsAsFactors = FALSE) %>%
+      rename(
+        var_y = Var1,
+        var_x = Var2,
+        p = Freq
+      ) %>%
+      mutate(
+        var_x_chr = as.character(var_x),
+        var_y_chr = as.character(var_y)
+      ) %>%
+      select(var_y_chr, var_x_chr, p)
+
+    cor_df <- cor_df %>%
+      left_join(p_df, by = c("var_y_chr", "var_x_chr"))
+  } else {
+    cor_df <- cor_df %>%
+      mutate(p = NA_real_)
+  }
+
+  cor_df <- cor_df %>%
+    mutate(
+      is_diag = var_x_chr == var_y_chr,
+
+      stars = case_when(
+        is.na(p) ~ "",
+        p <= 0.001 ~ "***",
+        p <= 0.01 ~ "**",
+        p <= 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+
+      rho_lab = if_else(
+        is.na(rho),
+        "",
+        sprintf("%.2f", rho)
+      ),
+
+      label_pair = case_when(
+        is.na(rho) ~ "",
+        is_diag & show_diagonal ~ paste0(var_x_chr, "\n—"),
+        is_diag & !show_diagonal ~ "",
+        TRUE ~ paste0(
+          var_y_chr,
+          "\nvs\n",
+          var_x_chr
+        )
+      ),
+
+      label_coef = case_when(
+        is.na(rho) ~ "",
+        is_diag ~ "",
+        show_stars ~ paste0(rho_lab, stars),
+        TRUE ~ rho_lab
+      )
+    )
+
+  ggplot(cor_df, aes(x = var_x, y = var_y, fill = rho)) +
+ geom_tile(color = "grey80", linewidth = 0.18) +
+
+    geom_text(
+      aes(label = label_pair),
+      size = text_size,
+      lineheight = 0.8,
+      color = "grey25"
+    ) +
+
+    geom_text(
+      aes(label = label_coef),
+      size = coef_size,
+      fontface = "bold",
+      color = "black",
+      nudge_y = -0.25
+    ) +
+
+    scale_fill_gradient2(
+      low = "blue",
+      mid = "white",
+      high = "red",
+      midpoint = 0,
+      limits = c(-1, 1),
+      na.value = "grey95",
+      name = expression(rho)
+    ) +
+
+    coord_fixed() +
+
+    labs(
+      title = title,
+      subtitle = "Lower triangle: ordinary Spearman; upper triangle: partial Spearman adjusted for SOFA",
+      x = NULL,
+      y = NULL
+    ) +
+
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.background = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA),
+      panel.grid = element_blank(),
+
+      axis.text.x = element_text(
+        angle = 90,
+        hjust = 1,
+        vjust = 0.5,
+        color = "black",
+        size = 8
+      ),
+      axis.text.y = element_text(
+        color = "black",
+        size = 8
+      ),
+
+      plot.title = element_text(
+        color = "black",
+        face = "bold",
+        hjust = 0.5
+      ),
+      plot.subtitle = element_text(
+        color = "grey30",
+        hjust = 0.5
+      ),
+
+      legend.text = element_text(color = "black"),
+      legend.title = element_text(color = "black")
+    )
+}
+
+p_tiles_SOFA <- plot_corr_tiles(
+  M_combo_SOFA,
+  P_combo_SOFA_plot,
+  title = "Spearman and SOFA-adjusted partial Spearman correlation matrix",
+  show_stars = TRUE,
+  show_diagonal = TRUE,
+  text_size = 1.3,
+  coef_size = 1.7
+)
+
+p_tiles_SOFA
+
+# Сохранение в векторные форматы ------------------------------------------
+
+if (!exists("GRAPHES_DIR")) {
+  GRAPHES_DIR <- "graphes"
+}
+
+dir.create(GRAPHES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+corr_width  <- max(24, 0.42 * ncol(M_combo_SOFA))
+corr_height <- max(24, 0.42 * ncol(M_combo_SOFA))
 
 svg(
   filename = file.path(GRAPHES_DIR, "corr_spearman_combo_partial_SOFA.svg"),
@@ -1782,7 +2239,8 @@ plot_corr_full(
   P_combo_SOFA_plot,
   title = "Lower triangle: ordinary Spearman; upper triangle: partial Spearman adjusted for SOFA",
   tl_cex = 0.7,
-  pch_cex = 0.5
+  pch_cex = 0.5,
+  show_numbers = FALSE
 )
 
 dev.off()
@@ -1799,10 +2257,36 @@ plot_corr_full(
   P_combo_SOFA_plot,
   title = "Lower triangle: ordinary Spearman; upper triangle: partial Spearman adjusted for SOFA",
   tl_cex = 0.7,
-  pch_cex = 0.5
+  pch_cex = 0.5,
+  show_numbers = FALSE
 )
 
 dev.off()
+
+ggsave(
+  filename = file.path(GRAPHES_DIR, "corr_spearman_combo_partial_SOFA_tiles.svg"),
+  plot = p_tiles_SOFA,
+  width = corr_width,
+  height = corr_height,
+  units = "in"
+)
+
+ggsave(
+  filename = file.path(GRAPHES_DIR, "corr_spearman_combo_partial_SOFA_tiles.pdf"),
+  plot = p_tiles_SOFA,
+  width = corr_width,
+  height = corr_height,
+  units = "in",
+  device = cairo_pdf
+)
+
+# Проверка фактического порядка переменных --------------------------------
+
+tibble(
+  position = seq_along(combo_order),
+  variable = combo_order
+)
+
 ```
 
 # Проверка PaFiO2 и фибриноген
@@ -1906,6 +2390,10 @@ tbl_vis
 # Это защищает модель от смешивания разных клинических статусов.
 df_base <- pt_top %>%
   filter(!is.na(outcome_logit))
+
+# SIC_score/SIC_positive намеренно не добавлены в эту модель вместе с SOFA:
+# SIC определяется с использованием SOFA, INR и тромбоцитов.
+# Для SIC нужна отдельная exploratory-модель с заменой SOFA, а не совместная поправка.
 
 # =========================================================
 # Logit A: + first_sorption_type (factor)
@@ -2275,7 +2763,8 @@ tp_keep <- c("m12h_0h", "48h_72h")
 vars <- c(
   "SOFA","PaFiO2_calc","lactate","creatinine","albumin","C_react_protein",
   "procalcitonin","D_dimer","fibrinogen","leucocytes","lymphocytes",
-  "neutrophils","NLR","thrombocytes","VIS2020", "VIS2020_0_excl"
+  "neutrophils","NLR","thrombocytes","VIS2020", "VIS2020_0_excl",
+  "INR", "SIC_score"
 )
 vars <- intersect(vars, names(patients_analysis_clin_window))
 
@@ -2370,12 +2859,17 @@ paired_wilcox_48_minus_0 <- function(data, variable, by, group, conf.level = 0.9
     )
 }
 
+paired_labels <- list()
+if ("INR" %in% vars) paired_labels$INR <- "МНО"
+if ("SIC_score" %in% vars) paired_labels$SIC_score <- "Индекс SIC, баллы"
+
 tbl <-
   patients_paired %>%
   tbl_summary(
     by = timepoint,
     include = -c(pat_record_id, clin_assess_dt),
     statistic = all_continuous() ~ "{median} ({p25}, {p75})",
+    label = paired_labels,
     missing = "no"
   ) %>%
   add_difference(
@@ -2403,6 +2897,79 @@ tbl
 tbl %>%
   as_flex_table() %>%
   flextable::save_as_pptx(path = file.path(TABLES_DIR, "paired_test.pptx"))
+
+# SIC-positive status — отдельный бинарный динамический результат.
+# Его не смешиваем с непрерывной таблицей Wilcoxon: для парных 0/1 данных
+# применяем McNemar test.
+if ("SIC_positive" %in% names(patients_analysis_clin_window)) {
+  sic_positive_pairs <- patients_analysis_clin_window %>%
+    filter(first_sorption_type == "LPS", timepoint %in% tp_keep) %>%
+    transmute(
+      pat_record_id,
+      timepoint,
+      SIC_positive = case_when(
+        as.character(SIC_positive) %in% c("1", "Да", "да", "TRUE", "true") ~ 1L,
+        as.character(SIC_positive) %in% c("0", "Нет", "нет", "FALSE", "false") ~ 0L,
+        TRUE ~ NA_integer_
+      )
+    ) %>%
+    distinct(pat_record_id, timepoint, .keep_all = TRUE) %>%
+    pivot_wider(names_from = timepoint, values_from = SIC_positive) %>%
+    filter(!is.na(.data[["m12h_0h"]]), !is.na(.data[["48h_72h"]]))
+
+  sic_n_pairs <- nrow(sic_positive_pairs)
+
+  sic_mcnemar_p <- if (sic_n_pairs > 0) {
+    sic_tab <- table(
+      factor(sic_positive_pairs[["m12h_0h"]], levels = c(0, 1)),
+      factor(sic_positive_pairs[["48h_72h"]], levels = c(0, 1))
+    )
+
+    tryCatch(
+      stats::mcnemar.test(sic_tab, correct = TRUE)$p.value,
+      error = function(e) NA_real_
+    )
+  } else {
+    NA_real_
+  }
+
+  sic_positive_summary <- tibble(
+    `Показатель` = "SIC-положительный статус",
+    `-12–0 ч` = if (sic_n_pairs > 0) {
+      sprintf(
+        "%d/%d (%.1f%%)",
+        sum(sic_positive_pairs[["m12h_0h"]] == 1),
+        sic_n_pairs,
+        100 * mean(sic_positive_pairs[["m12h_0h"]] == 1)
+      )
+    } else {
+      NA_character_
+    },
+    `48–72 ч` = if (sic_n_pairs > 0) {
+      sprintf(
+        "%d/%d (%.1f%%)",
+        sum(sic_positive_pairs[["48h_72h"]] == 1),
+        sic_n_pairs,
+        100 * mean(sic_positive_pairs[["48h_72h"]] == 1)
+      )
+    } else {
+      NA_character_
+    },
+    `McNemar p` = ifelse(
+      is.na(sic_mcnemar_p),
+      NA_character_,
+      format.pval(sic_mcnemar_p, digits = 2, eps = 1e-3)
+    ),
+    `N пар` = sic_n_pairs
+  )
+
+  sic_positive_summary
+
+  flextable::save_as_pptx(
+    flextable::autofit(flextable::flextable(sic_positive_summary)),
+    path = file.path(TABLES_DIR, "paired_SIC_positive_test.pptx")
+  )
+}
 ```
 
 ## SOFA Scatter по выборке
@@ -2519,10 +3086,17 @@ var_label_map <- dict_pat %>%
   filter(!is.na(short), short != "", !is.na(ru), ru != "") %>%
   { setNames(.$ru, .$short) }
 
+manual_plot_labels <- c(
+  INR = "МНО",
+  SIC_score = "Индекс SIC, баллы"
+)
+
 lab_var <- function(v) {
   v <- as.character(v)
-  lbl <- unname(var_label_map[v])  
-  if (is.na(lbl) || lbl == "") v else lbl
+  lbl_manual <- unname(manual_plot_labels[v])
+  lbl_dict <- unname(var_label_map[v])
+  lbl <- ifelse(!is.na(lbl_manual) & lbl_manual != "", lbl_manual, lbl_dict)
+  ifelse(is.na(lbl) | lbl == "", v, lbl)
 }
 
 # ---- переменные ----
@@ -3040,6 +3614,8 @@ vars_t0_compare <- c(
     vars_top,
     c(
       "icu_to_HA1_hours",
+      "ICU_to_antibiotics_dt",
+      "antibiotics_to_HA1_hours",
       "CT_count_pos",
       "LPS_count_pos",
       "devices_total_pos",
@@ -3097,7 +3673,8 @@ tbl_baseline_landmark_sorption <- pt_landmark_t0 %>%
         "vasopressors_if_used",
         "RRT_if_used",
         "MV_if_used",
-        "from_other_ICU_transfer"
+        "from_other_ICU_transfer",
+        "SIC_positive"
       )) ~ "dichotomous"
     ),
     value = list(
@@ -3105,7 +3682,8 @@ tbl_baseline_landmark_sorption <- pt_landmark_t0 %>%
         "vasopressors_if_used",
         "RRT_if_used",
         "MV_if_used",
-        "from_other_ICU_transfer"
+        "from_other_ICU_transfer",
+        "SIC_positive"
       )) ~ "Да"
     ),
     statistic = stat_top,
@@ -3183,14 +3761,16 @@ tbl_baseline_transfer <- pt_transfer_t0 %>%
       any_of(c(
         "vasopressors_if_used",
         "RRT_if_used",
-        "MV_if_used"
+        "MV_if_used",
+        "SIC_positive"
       )) ~ "dichotomous"
     ),
     value = list(
       any_of(c(
         "vasopressors_if_used",
         "RRT_if_used",
-        "MV_if_used"
+        "MV_if_used",
+        "SIC_positive"
       )) ~ "Да"
     ),
     statistic = stat_top,
@@ -3305,7 +3885,8 @@ tbl_baseline_anticoag <- pt_anticoag_t0 %>%
         "vasopressors_if_used",
         "RRT_if_used",
         "MV_if_used",
-        "from_other_ICU_transfer"
+        "from_other_ICU_transfer",
+        "SIC_positive"
       )) ~ "dichotomous"
     ),
     value = list(
@@ -3313,7 +3894,8 @@ tbl_baseline_anticoag <- pt_anticoag_t0 %>%
         "vasopressors_if_used",
         "RRT_if_used",
         "MV_if_used",
-        "from_other_ICU_transfer"
+        "from_other_ICU_transfer",
+        "SIC_positive"
       )) ~ "Да"
     ),
     statistic = stat_top,
@@ -3365,7 +3947,12 @@ pt_inr_t0 <- pt_top %>%
   ) %>%
   filter(!is.na(INR_group))
 
-vars_t0_compare_inr <- setdiff(vars_t0_compare, "INR")
+# SIC_score и SIC_positive включают INR в определение; сравнивать их между
+# группами, заданными по INR, было бы тавтологией.
+vars_t0_compare_inr <- setdiff(
+  vars_t0_compare,
+  c("INR", "SIC_score", "SIC_positive")
+)
 lbl_t0_compare_inr <- lbl_t0_compare[
   names(lbl_t0_compare) %in% vars_t0_compare_inr
 ]
@@ -3379,7 +3966,8 @@ tbl_baseline_inr_t0 <- pt_inr_t0 %>%
         "vasopressors_if_used",
         "RRT_if_used",
         "MV_if_used",
-        "from_other_ICU_transfer"
+        "from_other_ICU_transfer",
+        "SIC_positive"
       )) ~ "dichotomous"
     ),
     value = list(
@@ -3387,7 +3975,8 @@ tbl_baseline_inr_t0 <- pt_inr_t0 %>%
         "vasopressors_if_used",
         "RRT_if_used",
         "MV_if_used",
-        "from_other_ICU_transfer"
+        "from_other_ICU_transfer",
+        "SIC_positive"
       )) ~ "Да"
     ),
     statistic = stat_top,
