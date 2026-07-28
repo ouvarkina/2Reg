@@ -66,10 +66,11 @@ patients_indications_file <- optional_path(c(
 
 # output paths / flags
 
-patients_out_xlsx <- file.path(DATA_DIR, "2Reg_patients_tidy.xlsx")
-ha_out_xlsx       <- file.path(DATA_DIR, "2Reg_HA_tidy.xlsx")
-patients_out_rds  <- file.path(DATA_DIR, "patients_tidy.rds")
-ha_out_rds        <- file.path(DATA_DIR, "HA_tidy.rds")
+patients_out_xlsx          <- file.path(DATA_DIR, "2Reg_patients_tidy.xlsx")
+ha_out_xlsx                <- file.path(DATA_DIR, "2Reg_HA_tidy.xlsx")
+patients_out_rds           <- file.path(DATA_DIR, "patients_tidy.rds")
+ha_out_rds                 <- file.path(DATA_DIR, "HA_tidy.rds")
+baseline_weights_out_xlsx  <- file.path(DATA_DIR, "2Reg_baseline_redundancy_weights.xlsx")
 
 REPORT_TZ <- "UTC"
 save_xlsx <- TRUE
@@ -81,6 +82,11 @@ dictionary_url <- "https://docs.google.com/spreadsheets/d/1bsOuvblNg1l3tNiAV8Se_
 dictionary_sheet <- "Dictionary"
 build_baseline_ranks <- TRUE
 baseline_timepoint_for_ranks <- "m12h_0h"
+
+# Полуэвристическая поправка на дублирование информации:
+# independent_information_j = 1 / sum_k(cor(rank_j, rank_k)^2),
+# включая 1 на диагонали.
+baseline_redundancy_method <- "row_sum_r2"
 
 # 3. Small helpers --------------------------------------------------------
 
@@ -1715,7 +1721,8 @@ if (isTRUE(build_baseline_ranks)) {
     "Казуальный тип",
     "Включать в baseline_rank_vars",
     "Единица в датасете",
-    "Референсный уровень / уровень наименьшего риска"
+    "Референсный уровень / уровень наименьшего риска",
+    "Сила ассоциации"
   )
   
   missing_dictionary_columns <- setdiff(required_dictionary_columns, names(dictionary_raw))
@@ -1734,7 +1741,8 @@ if (isTRUE(build_baseline_ranks)) {
       unit = clean_text_rank(.data[["Единица в датасете"]]),
       optimum_reference = clean_text_rank(
         .data[["Референсный уровень / уровень наименьшего риска"]]
-      )
+      ),
+      association_strength = to_num(.data[["Сила ассоциации"]])
     ) %>%
     dplyr::filter(
       causal_type == "baseline",
@@ -1747,6 +1755,20 @@ if (isTRUE(build_baseline_ranks)) {
     stop("В Dictionary нет baseline-переменных с `Включать в baseline_rank_vars = Да`.")
   }
   
+  invalid_association_strength <- baseline_candidates %>%
+    dplyr::filter(
+      is.na(association_strength) |
+        !is.finite(association_strength) |
+        association_strength < 0
+    )
+
+  if (nrow(invalid_association_strength) > 0L) {
+    stop(
+      "Для всех baseline rank variables должна быть задана неотрицательная `Сила ассоциации`. Проверьте: ",
+      paste(invalid_association_strength$variable, collapse = ", ")
+    )
+  }
+
   if (anyDuplicated(baseline_candidates$variable) > 0L) {
     stop(
       "В Dictionary есть дублирующиеся baseline rank rules для: ",
@@ -1879,20 +1901,248 @@ if (isTRUE(build_baseline_ranks)) {
       values_from = severity_rank,
       names_glue = "{variable}_rank"
     )
-  
-  # Если скрипт перезапускается в текущей R-сессии, сначала удаляем старые *_rank,
-  # чтобы не оставить устаревшие колонки при изменении Dictionary.
-  old_rank_cols <- grep("_rank$", names(patients_tidy), value = TRUE)
-  if (length(old_rank_cols) > 0) {
-    patients_tidy <- patients_tidy %>% dplyr::select(-dplyr::all_of(old_rank_cols))
+
+  # 13c. Redundancy weights and composite baseline severity index ---------
+  #
+  # Корреляции считаем между самими severity ranks, потому что именно эти
+  # преобразованные компоненты затем суммируются в итоговом индексе.
+  # Pearson correlation между уже ранжированными значениями оценивает
+  # линейную связь на шкале рангов; знак не влияет, так как r возводится
+  # в квадрат.
+  #
+  # Полуэвристический вес независимой информации:
+  #   independent_information_j = 1 / sum_k(r_jk^2)
+  # Диагональ r_jj = 1 включена.
+  #
+  # Итоговый вес переменной:
+  #   composite_weight_j = independent_information_j * association_strength_j
+  #
+  # Итоговый индекс пациента:
+  #   baseline_severity_index_i = sum_j(severity_rank_ij * composite_weight_j)
+
+  if (!identical(baseline_redundancy_method, "row_sum_r2")) {
+    stop(
+      "Пока поддерживается baseline_redundancy_method = `row_sum_r2`. Получено: ",
+      baseline_redundancy_method
+    )
   }
-  
+
+  baseline_rank_matrix <- baseline_rank_long %>%
+    dplyr::select(pat_record_id, variable, severity_rank) %>%
+    tidyr::pivot_wider(
+      names_from = variable,
+      values_from = severity_rank
+    ) %>%
+    dplyr::select(
+      pat_record_id,
+      dplyr::all_of(rank_rules$variable)
+    )
+
+  rank_variable_qc <- tibble::tibble(
+    variable = rank_rules$variable,
+    n_observed = vapply(
+      baseline_rank_matrix[rank_rules$variable],
+      function(x) sum(!is.na(x)),
+      integer(1)
+    ),
+    n_unique_observed = vapply(
+      baseline_rank_matrix[rank_rules$variable],
+      function(x) dplyr::n_distinct(x[!is.na(x)]),
+      integer(1)
+    )
+  ) %>%
+    dplyr::mutate(
+      usable_for_redundancy = n_observed >= 3L & n_unique_observed >= 2L
+    )
+
+  usable_rank_variables <- rank_variable_qc %>%
+    dplyr::filter(usable_for_redundancy) %>%
+    dplyr::pull(variable)
+
+  baseline_rank_cor_matrix <- matrix(
+    NA_real_,
+    nrow = nrow(rank_rules),
+    ncol = nrow(rank_rules),
+    dimnames = list(rank_rules$variable, rank_rules$variable)
+  )
+
+  baseline_rank_pairwise_n <- matrix(
+    0L,
+    nrow = nrow(rank_rules),
+    ncol = nrow(rank_rules),
+    dimnames = list(rank_rules$variable, rank_rules$variable)
+  )
+
+  if (length(usable_rank_variables) > 0L) {
+    rank_matrix_usable <- baseline_rank_matrix %>%
+      dplyr::select(dplyr::all_of(usable_rank_variables)) %>%
+      as.data.frame()
+
+    not_missing_matrix <- !is.na(as.matrix(rank_matrix_usable))
+    pairwise_n_usable <- t(not_missing_matrix) %*% not_missing_matrix
+
+    if (length(usable_rank_variables) == 1L) {
+      cor_usable <- matrix(
+        1,
+        nrow = 1L,
+        ncol = 1L,
+        dimnames = list(usable_rank_variables, usable_rank_variables)
+      )
+    } else {
+      cor_usable <- suppressWarnings(stats::cor(
+        rank_matrix_usable,
+        use = "pairwise.complete.obs",
+        method = "pearson"
+      ))
+      diag(cor_usable) <- 1
+    }
+
+    baseline_rank_cor_matrix[
+      usable_rank_variables,
+      usable_rank_variables
+    ] <- cor_usable
+
+    baseline_rank_pairwise_n[
+      usable_rank_variables,
+      usable_rank_variables
+    ] <- pairwise_n_usable
+  }
+
+  redundancy_denominator <- rep(NA_real_, nrow(rank_rules))
+  names(redundancy_denominator) <- rank_rules$variable
+
+  if (length(usable_rank_variables) > 0L) {
+    redundancy_denominator[usable_rank_variables] <- rowSums(
+      baseline_rank_cor_matrix[
+        usable_rank_variables,
+        usable_rank_variables,
+        drop = FALSE
+      ]^2,
+      na.rm = TRUE
+    )
+  }
+
+  baseline_redundancy_weights <- rank_rules %>%
+    dplyr::select(
+      variable,
+      label,
+      data_type,
+      association_strength
+    ) %>%
+    dplyr::left_join(rank_variable_qc, by = "variable") %>%
+    dplyr::mutate(
+      n_estimable_correlations = vapply(
+        variable,
+        function(v) sum(!is.na(baseline_rank_cor_matrix[v, ])),
+        integer(1)
+      ),
+      redundancy_denominator = unname(redundancy_denominator[variable]),
+      independent_information = dplyr::case_when(
+        !usable_for_redundancy ~ 0,
+        is.na(redundancy_denominator) | redundancy_denominator <= 0 ~ NA_real_,
+        TRUE ~ 1 / redundancy_denominator
+      ),
+      independent_information_percent = 100 * independent_information,
+      composite_weight = association_strength * independent_information
+    ) %>%
+    dplyr::mutate(
+      composite_weight_normalized = if (
+        sum(composite_weight, na.rm = TRUE) > 0
+      ) {
+        composite_weight / sum(composite_weight, na.rm = TRUE)
+      } else {
+        rep(NA_real_, dplyr::n())
+      }
+    )
+
+  total_composite_weight <- sum(
+    baseline_redundancy_weights$composite_weight,
+    na.rm = TRUE
+  )
+  total_weighted_variables <- sum(
+    !is.na(baseline_redundancy_weights$composite_weight) &
+      baseline_redundancy_weights$composite_weight > 0
+  )
+
+  baseline_severity_contributions <- baseline_rank_long %>%
+    dplyr::select(pat_record_id, variable, severity_rank) %>%
+    dplyr::left_join(
+      baseline_redundancy_weights %>%
+        dplyr::select(
+          variable,
+          association_strength,
+          independent_information,
+          composite_weight
+        ),
+      by = "variable"
+    ) %>%
+    dplyr::mutate(
+      weighted_contribution = severity_rank * composite_weight,
+      observed_weight = dplyr::if_else(
+        !is.na(severity_rank) & !is.na(composite_weight),
+        composite_weight,
+        0
+      )
+    )
+
+  baseline_severity_by_patient <- baseline_severity_contributions %>%
+    dplyr::group_by(pat_record_id) %>%
+    dplyr::summarise(
+      baseline_severity_index = dplyr::if_else(
+        any(!is.na(weighted_contribution)),
+        sum(weighted_contribution, na.rm = TRUE),
+        NA_real_
+      ),
+      baseline_severity_n_observed = sum(
+        !is.na(severity_rank) &
+          !is.na(composite_weight) &
+          composite_weight > 0
+      ),
+      baseline_severity_n_total = total_weighted_variables,
+      baseline_severity_weight_observed = sum(observed_weight, na.rm = TRUE),
+      baseline_severity_weight_total = total_composite_weight,
+      baseline_severity_coverage = dplyr::if_else(
+        total_composite_weight > 0,
+        baseline_severity_weight_observed / total_composite_weight,
+        NA_real_
+      ),
+      .groups = "drop"
+    )
+
+  # Если скрипт перезапускается в текущей R-сессии, сначала удаляем старые
+  # *_rank и прежние версии итогового индекса.
+  old_rank_cols <- grep("_rank$", names(patients_tidy), value = TRUE)
+  old_baseline_severity_cols <- c(
+    "baseline_severity_index",
+    "baseline_severity_n_observed",
+    "baseline_severity_n_total",
+    "baseline_severity_weight_observed",
+    "baseline_severity_weight_total",
+    "baseline_severity_coverage"
+  )
+
   patients_tidy <- patients_tidy %>%
-    dplyr::left_join(baseline_rank_wide, by = "pat_record_id")
-  
+    dplyr::select(
+      -dplyr::any_of(c(old_rank_cols, old_baseline_severity_cols))
+    ) %>%
+    dplyr::left_join(baseline_rank_wide, by = "pat_record_id") %>%
+    dplyr::left_join(baseline_severity_by_patient, by = "pat_record_id")
+
   cat("\nBaseline ranks added to patients_tidy:",
       ncol(baseline_rank_wide) - 1L, "variables\n")
   cat("Rank variables:", paste(rank_rules$variable, collapse = ", "), "\n")
+  cat(
+    "Variables with non-zero composite weight:",
+    total_weighted_variables, "\n"
+  )
+  cat(
+    "Median baseline severity coverage:",
+    round(stats::median(
+      baseline_severity_by_patient$baseline_severity_coverage,
+      na.rm = TRUE
+    ), 3),
+    "\n"
+  )
 }
 
 # 14. QA ------------------------------------------------------------------
@@ -2042,4 +2292,30 @@ if (isTRUE(save_rds)) {
 if (isTRUE(save_xlsx)) {
   openxlsx::write.xlsx(patients_tidy, patients_out_xlsx, asTable = TRUE, overwrite = TRUE)
   openxlsx::write.xlsx(HA_tidy, ha_out_xlsx, asTable = TRUE, overwrite = TRUE)
+
+  if (exists("baseline_redundancy_weights", inherits = FALSE)) {
+    correlation_matrix_out <- as.data.frame(
+      baseline_rank_cor_matrix,
+      check.names = FALSE
+    ) %>%
+      tibble::rownames_to_column("variable")
+
+    pairwise_n_out <- as.data.frame(
+      baseline_rank_pairwise_n,
+      check.names = FALSE
+    ) %>%
+      tibble::rownames_to_column("variable")
+
+    openxlsx::write.xlsx(
+      list(
+        weights = baseline_redundancy_weights,
+        correlations = correlation_matrix_out,
+        pairwise_n = pairwise_n_out,
+        patient_index = baseline_severity_by_patient
+      ),
+      baseline_weights_out_xlsx,
+      asTable = TRUE,
+      overwrite = TRUE
+    )
+  }
 }

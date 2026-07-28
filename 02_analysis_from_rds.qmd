@@ -1537,6 +1537,57 @@ P_hclust_plot <- prep_p_for_corrplot(P_hclust, M_hclust)
 
 col_pal <- colorRampPalette(c("blue", "white", "red"))(200)
 
+# Общая функция для отрисовки полной корреляционной матрицы.
+# Должна быть определена до первого вызова этой функции.
+
+plot_corr_full <- function(
+  M_plot,
+  P_plot,
+  title = NULL,
+  tl_cex = 0.7,
+  pch_cex = 0.5,
+  show_numbers = FALSE,
+  number_cex = 0.3
+) {
+  par(mar = c(1, 1, 4, 2))
+
+  corrplot_args <- list(
+    corr = M_plot,
+    method = "color",
+    type = "full",
+    diag = TRUE,
+    order = "original",
+
+    col = col_pal,
+    cl.lim = c(-1, 1),
+
+    tl.pos = "lt",
+    tl.col = "brown4",
+    tl.cex = tl_cex,
+    tl.srt = 90,
+
+    addgrid.col = "grey85",
+    na.label = " ",
+
+    p.mat = P_plot,
+    sig.level = c(0.001, 0.01, 0.05),
+    insig = "label_sig",
+    pch.col = "black",
+    pch.cex = pch_cex,
+
+    title = title,
+    mar = c(0, 0, 2, 0)
+  )
+
+  if (show_numbers) {
+    corrplot_args$addCoef.col <- "black"
+    corrplot_args$number.cex <- number_cex
+    corrplot_args$number.digits <- 2
+  }
+
+  do.call(corrplot::corrplot, corrplot_args)
+}
+
 # функция
 
 plot_corr_tiles <- function(
@@ -1993,54 +2044,6 @@ P_combo_SOFA_plot <- prep_p_for_corrplot(P_combo_SOFA, M_combo_SOFA)
 
 # Обычный corrplot-вариант -------------------------------------------------
 
-plot_corr_full <- function(
-  M_plot,
-  P_plot,
-  title = NULL,
-  tl_cex = 0.7,
-  pch_cex = 0.5,
-  show_numbers = FALSE,
-  number_cex = 0.3
-) {
-  par(mar = c(1, 1, 4, 2))
-
-  corrplot_args <- list(
-    corr = M_plot,
-    method = "color",
-    type = "full",
-    diag = TRUE,
-    order = "original",
-
-    col = col_pal,
-    cl.lim = c(-1, 1),
-
-    tl.pos = "lt",
-    tl.col = "brown4",
-    tl.cex = tl_cex,
-    tl.srt = 90,
-
-    addgrid.col = "grey85",
-    na.label = " ",
-
-    p.mat = P_plot,
-    sig.level = c(0.001, 0.01, 0.05),
-    insig = "label_sig",
-    pch.col = "black",
-    pch.cex = pch_cex,
-
-    title = title,
-    mar = c(0, 0, 2, 0)
-  )
-
-  if (show_numbers) {
-    corrplot_args$addCoef.col <- "black"
-    corrplot_args$number.cex <- number_cex
-    corrplot_args$number.digits <- 2
-  }
-
-  do.call(corrplot::corrplot, corrplot_args)
-}
-
 plot_corr_full(
   M_combo_SOFA,
   P_combo_SOFA_plot,
@@ -2225,6 +2228,8 @@ if (!exists("GRAPHES_DIR")) {
 
 dir.create(GRAPHES_DIR, showWarnings = FALSE, recursive = TRUE)
 
+# Матрица большая, поэтому размеры графика могут превышать стандартный лимит ggsave 50".
+# Для этих двух файлов ниже явно используем limitsize = FALSE.
 corr_width  <- max(24, 0.42 * ncol(M_combo_SOFA))
 corr_height <- max(24, 0.42 * ncol(M_combo_SOFA))
 
@@ -2268,7 +2273,8 @@ ggsave(
   plot = p_tiles_SOFA,
   width = corr_width,
   height = corr_height,
-  units = "in"
+  units = "in",
+  limitsize = FALSE
 )
 
 ggsave(
@@ -2277,7 +2283,8 @@ ggsave(
   width = corr_width,
   height = corr_height,
   units = "in",
-  device = cairo_pdf
+  device = cairo_pdf,
+  limitsize = FALSE
 )
 
 # Проверка фактического порядка переменных --------------------------------
@@ -2287,6 +2294,1282 @@ tibble(
   variable = combo_order
 )
 
+```
+
+# Baseline: PCA, heatmap, clustering
+
+В этом блоке PCA, коррелограмма, heatmap и кластеры строятся по исходным baseline-значениям, а не по рангам. Входной набор берётся из Google Dictionary по флагу `Включать в baseline_rank_vars = Да`, но для классического PCA используются только numeric-переменные. Дополнительно принудительно добавляется `icu_to_HA1_hours`, потому что для текущего анализа важно посмотреть, как время до первой гемоперфузии располагается относительно baseline-структуры.
+
+## Чтение словаря, выбор переменных
+
+```{r}
+#| label: baseline-structure-vars
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(readr)
+library(ggplot2)
+library(googlesheets4)
+library(tibble)
+library(purrr)
+
+dictionary_url <- "https://docs.google.com/spreadsheets/d/1bsOuvblNg1l3tNiAV8Se_Kf4_IcQjsRtxISyNzoQqLw/edit"
+dictionary_sheet <- "Dictionary"
+
+options(gargle_oauth_cache = TRUE)
+gs4_auth(email = TRUE, scopes = "spreadsheets.readonly")
+
+clean_text <- function(x) {
+  x <- as.character(x)
+  x <- str_replace_all(x, "\\u00A0", " ")
+  x <- str_squish(x)
+  na_if(x, "")
+}
+
+dictionary <- read_sheet(
+  ss = dictionary_url,
+  sheet = dictionary_sheet,
+  na = c("", "NA", "N/A")
+)
+
+dictionary_min <- dictionary %>%
+  transmute(
+    variable = clean_text(`Имя переменной`),
+    label = clean_text(`Название`),
+    data_type = str_to_lower(clean_text(`Тип переменной`)),
+    causal_type = str_to_lower(clean_text(`Казуальный тип`)),
+    use_for_baseline_structure = str_to_lower(
+      clean_text(`Включать в baseline_rank_vars`)
+    )
+  ) %>%
+  filter(!is.na(variable))
+
+baseline_structure_vars_core <- dictionary_min %>%
+  filter(
+    causal_type == "baseline",
+    use_for_baseline_structure == "да",
+    data_type == "numeric",
+    !str_detect(variable, "_rank$")
+  ) %>%
+  filter(variable %in% names(patients_tidy)) %>%
+  distinct(variable, .keep_all = TRUE)
+
+# Это не чистая baseline-характеристика пациента, а timing treatment/context.
+# Добавляем принудительно по просьбе исследовательской группы.
+extra_structure_vars <- tibble(
+  variable = "icu_to_HA1_hours",
+  label = "Время от поступления в ОРИТ до первой гемоперфузии, ч",
+  data_type = "numeric",
+  causal_type = "treatment_context",
+  use_for_baseline_structure = "forced"
+) %>%
+  filter(variable %in% names(patients_tidy))
+
+baseline_structure_vars <- bind_rows(
+  baseline_structure_vars_core,
+  extra_structure_vars
+) %>%
+  distinct(variable, .keep_all = TRUE)
+
+# Бинарные/категориальные показатели НЕ входят в классический PCA.
+# Используем их как аннотации и для описания кластеров.
+baseline_binary_annotation_vars <- intersect(
+  c(
+    "ICU_6_month_history",
+    "is_bacteremic",
+    "is_pat_gram_plus",
+    "is_pat_gram_minus"
+  ),
+  names(patients_tidy)
+)
+
+baseline_structure_vars
+baseline_binary_annotation_vars
+```
+
+## Сборка baseline matrix и QC
+
+```{r}
+#| label: baseline-structure-matrix
+
+patients_baseline_structure <- patients_tidy %>%
+  filter(timepoint == "m12h_0h", !is.na(pat_record_id))
+
+duplicate_baseline_ids <- patients_baseline_structure %>%
+  count(pat_record_id) %>%
+  filter(n > 1)
+
+if (nrow(duplicate_baseline_ids) > 0) {
+  stop(
+    "На baseline больше одной строки на пациента. Примеры ID: ",
+    paste(head(duplicate_baseline_ids$pat_record_id, 10), collapse = ", ")
+  )
+}
+
+# Аннотации для PCA/heatmap/кластеров: outcome + важные binary baseline-поля.
+# Treatment-переменные не используются как аннотации, кроме icu_to_HA1_hours,
+# который добавлен в сам PCA-набор как заранее оговорённое исключение.
+baseline_binary_annotations <- patients_baseline_structure %>%
+  select(pat_record_id, any_of(baseline_binary_annotation_vars)) %>%
+  mutate(across(-pat_record_id, ~ as.factor(.x)))
+
+baseline_structure_annotations <- pt_top %>%
+  select(
+    pat_record_id,
+    any_of(c("outcome", "outcome_logit"))
+  ) %>%
+  distinct(pat_record_id, .keep_all = TRUE) %>%
+  left_join(baseline_binary_annotations, by = "pat_record_id")
+
+patients_baseline_structure_annotated <- patients_baseline_structure %>%
+  select(-any_of(c("outcome", "outcome_logit"))) %>%
+  left_join(baseline_structure_annotations, by = "pat_record_id")
+
+if ("outcome_logit" %in% names(patients_baseline_structure_annotated)) {
+  patients_baseline_structure_annotated <- patients_baseline_structure_annotated %>%
+    mutate(
+      outcome_logit_num = suppressWarnings(as.integer(as.character(outcome_logit)))
+    )
+}
+
+structure_vars <- baseline_structure_vars$variable
+
+baseline_structure_qc <- patients_baseline_structure %>%
+  summarise(
+    across(
+      all_of(structure_vars),
+      list(
+        n_non_missing = ~ sum(!is.na(.x)),
+        n_missing = ~ sum(is.na(.x)),
+        n_unique = ~ n_distinct(.x, na.rm = TRUE),
+        median = ~ median(as.numeric(.x), na.rm = TRUE),
+        q1 = ~ quantile(as.numeric(.x), 0.25, na.rm = TRUE),
+        q3 = ~ quantile(as.numeric(.x), 0.75, na.rm = TRUE)
+      ),
+      .names = "{.col}__{.fn}"
+    )
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to = c("variable", ".value"),
+    names_sep = "__"
+  ) %>%
+  mutate(
+    missing_prop = n_missing / (n_missing + n_non_missing)
+  ) %>%
+  left_join(baseline_structure_vars, by = "variable") %>%
+  arrange(desc(missing_prop), variable)
+
+baseline_binary_annotation_qc <- patients_baseline_structure %>%
+  select(pat_record_id, any_of(baseline_binary_annotation_vars)) %>%
+  pivot_longer(
+    cols = -pat_record_id,
+    names_to = "variable",
+    values_to = "value",
+    values_transform = list(value = as.character)
+  ) %>%
+  count(variable, value, name = "n") %>%
+  group_by(variable) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup() %>%
+  arrange(variable, desc(n))
+
+baseline_structure_qc
+baseline_binary_annotation_qc
+```
+
+## Проверка, какие переменные не учли
+
+```{r}
+#| label: baseline-structure-variable-check
+
+baseline_structure_variable_check <- dictionary_min %>%
+  filter(
+    causal_type == "baseline",
+    use_for_baseline_structure == "да",
+    !str_detect(variable, "_rank$")
+  ) %>%
+  mutate(
+    variable_exists = variable %in% names(patients_tidy),
+    included_in_numeric_pca = variable %in% baseline_structure_vars_core$variable,
+    not_included_reason = case_when(
+      !variable_exists ~ "variable missing in patients_tidy",
+      data_type != "numeric" ~ "not numeric: used only as annotation/description",
+      included_in_numeric_pca ~ "included",
+      TRUE ~ "not included: check manually"
+    )
+  ) %>%
+  select(
+    variable,
+    label,
+    data_type,
+    causal_type,
+    use_for_baseline_structure,
+    variable_exists,
+    included_in_numeric_pca,
+    not_included_reason
+  ) %>%
+  arrange(not_included_reason, variable)
+
+baseline_structure_variable_check
+```
+
+## Подготовка числовой матрицы: log-transform, two-sided 5% TRIM, scale
+
+```{r}
+#| label: baseline-structure-preprocess
+
+max_missing_prop <- 0.50
+min_n_unique <- 2
+
+# TRIM / winsorization:
+# пациентов НЕ удаляем.
+# Значения ниже 5-го процентиля заменяем на 5-й процентиль.
+# Значения выше 95-го процентиля заменяем на 95-й процентиль.
+trim_tail_prop <- 0.05
+trim_lower_quantile <- trim_tail_prop
+trim_upper_quantile <- 1 - trim_tail_prop
+
+structure_vars_used <- baseline_structure_qc %>%
+  filter(
+    missing_prop <= max_missing_prop,
+    n_unique >= min_n_unique
+  ) %>%
+  pull(variable)
+
+baseline_numeric_original <- patients_baseline_structure %>%
+  select(pat_record_id, all_of(structure_vars_used)) %>%
+  mutate(
+    across(
+      -pat_record_id,
+      ~ suppressWarnings(as.numeric(.x))
+    )
+  )
+
+# Проверка заведомо некорректных значений для переменных контекста/узких шкал.
+# Эти исправления применяются только внутри PCA/heatmap-блока, patients_tidy не меняется.
+inr_min_allowed <- 0.5
+inr_max_allowed <- 10
+
+baseline_context_error_qc <- bind_rows(
+  if ("icu_to_HA1_hours" %in% names(baseline_numeric_original)) {
+    baseline_numeric_original %>%
+      filter(!is.na(icu_to_HA1_hours), icu_to_HA1_hours < 0) %>%
+      transmute(
+        pat_record_id,
+        variable = "icu_to_HA1_hours",
+        value = icu_to_HA1_hours,
+        issue = "negative value; should not be negative"
+      )
+  },
+  if ("INR" %in% names(baseline_numeric_original)) {
+    baseline_numeric_original %>%
+      filter(
+        !is.na(INR),
+        INR < inr_min_allowed | INR > inr_max_allowed
+      ) %>%
+      transmute(
+        pat_record_id,
+        variable = "INR",
+        value = INR,
+        issue = paste0(
+          "outside allowed range for PCA: ",
+          inr_min_allowed,
+          "–",
+          inr_max_allowed
+        )
+      )
+  }
+)
+
+baseline_numeric_raw <- baseline_numeric_original
+
+if ("icu_to_HA1_hours" %in% names(baseline_numeric_raw)) {
+  baseline_numeric_raw <- baseline_numeric_raw %>%
+    mutate(
+      icu_to_HA1_hours = if_else(
+        !is.na(icu_to_HA1_hours) & icu_to_HA1_hours < 0,
+        NA_real_,
+        icu_to_HA1_hours
+      )
+    )
+}
+
+if ("INR" %in% names(baseline_numeric_raw)) {
+  baseline_numeric_raw <- baseline_numeric_raw %>%
+    mutate(
+      INR = if_else(
+        !is.na(INR) & (INR < inr_min_allowed | INR > inr_max_allowed),
+        NA_real_,
+        INR
+      )
+    )
+}
+
+skewness_simple <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) < 3 || sd(x) == 0) {
+    return(NA_real_)
+  }
+  mean((x - mean(x))^3) / sd(x)^3
+}
+
+# Логарифмируем только заранее выбранные скошенные лабораторные показатели.
+# auto_log1p ниже оставлен только как диагностическая подсказка, но не управляет PCA.
+log1p_vars_manual <- intersect(
+  c(
+    "C_react_protein",
+    "procalcitonin",
+    "D_dimer",
+    "lactate",
+    "creatinine",
+    "bilirubin_total"
+  ),
+  structure_vars_used
+)
+
+log_transform_qc <- baseline_numeric_raw %>%
+  summarise(
+    across(
+      -pat_record_id,
+      list(
+        min_value = ~ min(.x, na.rm = TRUE),
+        max_value = ~ max(.x, na.rm = TRUE),
+        skewness = skewness_simple
+      ),
+      .names = "{.col}__{.fn}"
+    )
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to = c("variable", ".value"),
+    names_sep = "__"
+  ) %>%
+  mutate(
+    auto_log1p_suggestion = !is.na(skewness) & min_value >= 0 & skewness > 1,
+    manual_log1p = variable %in% log1p_vars_manual,
+    use_log1p = manual_log1p
+  ) %>%
+  arrange(desc(use_log1p), desc(abs(skewness)))
+
+log1p_vars <- log_transform_qc %>%
+  filter(use_log1p) %>%
+  pull(variable)
+
+# Переменные-шкалы/контекстные переменные оставляем в исходной шкале:
+# не логарифмируем и не подвергаем TRIM/winsorization.
+# После этого они всё равно стандартизуются для PCA.
+no_trim_vars <- intersect(
+  c(
+    "charlson_index",
+    "INR",
+    "icu_to_HA1_hours",
+    "SOFA",
+    "VIS2020",
+    "BMI",
+    "age_yr",
+    "avg_BP",
+    "PaFiO2_calc"
+  ),
+  structure_vars_used
+)
+
+median_impute <- function(x) {
+  x <- as.numeric(x)
+  med <- median(x, na.rm = TRUE)
+  if (is.na(med)) {
+    return(x)
+  }
+  x[is.na(x)] <- med
+  x
+}
+
+winsorize_two_sided <- function(
+  x,
+  lower_prob = 0.05,
+  upper_prob = 0.95
+) {
+  lower_cutoff <- quantile(
+    x,
+    probs = lower_prob,
+    na.rm = TRUE,
+    names = FALSE
+  )
+
+  upper_cutoff <- quantile(
+    x,
+    probs = upper_prob,
+    na.rm = TRUE,
+    names = FALSE
+  )
+
+  if (is.na(lower_cutoff) || is.na(upper_cutoff)) {
+    return(x)
+  }
+
+  x <- pmax(x, lower_cutoff)
+  x <- pmin(x, upper_cutoff)
+  x
+}
+
+baseline_numeric_log_imputed <- baseline_numeric_raw %>%
+  mutate(
+    across(
+      all_of(log1p_vars),
+      ~ if_else(.x < 0, NA_real_, log1p(.x))
+    )
+  ) %>%
+  mutate(
+    across(
+      -pat_record_id,
+      median_impute
+    )
+  )
+
+trim_cutoffs <- baseline_numeric_log_imputed %>%
+  summarise(
+    across(
+      -pat_record_id,
+      list(
+        trim_lower_value = ~ quantile(
+          .x,
+          probs = trim_lower_quantile,
+          na.rm = TRUE,
+          names = FALSE
+        ),
+        trim_upper_value = ~ quantile(
+          .x,
+          probs = trim_upper_quantile,
+          na.rm = TRUE,
+          names = FALSE
+        )
+      ),
+      .names = "{.col}__{.fn}"
+    )
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to = c("variable", ".value"),
+    names_sep = "__"
+  )
+
+trim_qc <- baseline_numeric_log_imputed %>%
+  pivot_longer(
+    cols = -pat_record_id,
+    names_to = "variable",
+    values_to = "value_after_log_impute"
+  ) %>%
+  left_join(trim_cutoffs, by = "variable") %>%
+  mutate(
+    use_two_sided_trim = !variable %in% no_trim_vars,
+    below_lower_cutoff = value_after_log_impute < trim_lower_value,
+    above_upper_cutoff = value_after_log_impute > trim_upper_value
+  ) %>%
+  group_by(
+    variable,
+    trim_lower_value,
+    trim_upper_value,
+    use_two_sided_trim
+  ) %>%
+  summarise(
+    n_patients = n(),
+    n_below_lower_cutoff = sum(below_lower_cutoff, na.rm = TRUE),
+    n_above_upper_cutoff = sum(above_upper_cutoff, na.rm = TRUE),
+    n_trimmed_lower = if_else(
+      first(use_two_sided_trim),
+      n_below_lower_cutoff,
+      0L
+    ),
+    n_trimmed_upper = if_else(
+      first(use_two_sided_trim),
+      n_above_upper_cutoff,
+      0L
+    ),
+    prop_trimmed_lower = n_trimmed_lower / n_patients,
+    prop_trimmed_upper = n_trimmed_upper / n_patients,
+    .groups = "drop"
+  ) %>%
+  left_join(
+    log_transform_qc %>% select(variable, use_log1p, skewness),
+    by = "variable"
+  ) %>%
+  arrange(desc(n_trimmed_upper + n_trimmed_lower), variable)
+
+trim_vars <- setdiff(
+  names(baseline_numeric_log_imputed),
+  c("pat_record_id", no_trim_vars)
+)
+
+baseline_numeric_matrix <- baseline_numeric_log_imputed %>%
+  mutate(
+    across(
+      all_of(trim_vars),
+      ~ winsorize_two_sided(
+        .x,
+        lower_prob = trim_lower_quantile,
+        upper_prob = trim_upper_quantile
+      )
+    )
+  )
+
+# Проверяем, что winsorization не удаляет пациентов.
+trim_patient_check <- tibble(
+  n_patients_before_trim = nrow(baseline_numeric_log_imputed),
+  n_patients_after_trim = nrow(baseline_numeric_matrix),
+  patients_removed_by_trim = n_patients_before_trim - n_patients_after_trim
+)
+
+X_untrimmed <- baseline_numeric_log_imputed %>%
+  select(-pat_record_id) %>%
+  as.matrix()
+rownames(X_untrimmed) <- baseline_numeric_log_imputed$pat_record_id
+
+X <- baseline_numeric_matrix %>%
+  select(-pat_record_id) %>%
+  as.matrix()
+rownames(X) <- baseline_numeric_matrix$pat_record_id
+
+# Убираем колонки с нулевой дисперсией после иммутации и TRIM.
+nonzero_sd <- apply(X, 2, sd, na.rm = TRUE) > 0
+X <- X[, nonzero_sd, drop = FALSE]
+X_untrimmed <- X_untrimmed[, colnames(X), drop = FALSE]
+
+X_scaled_untrimmed <- scale(X_untrimmed)
+X_scaled <- scale(X)
+
+structure_vars_used <- colnames(X_scaled)
+
+baseline_context_error_qc
+log_transform_qc
+trim_qc
+trim_patient_check
+no_trim_vars
+structure_vars_used
+dim(X_scaled)
+```
+
+## Коррелограмма переменных
+
+```{r}
+#| label: baseline-correlation-heatmap
+#| fig.width: 9
+#| fig.height: 8
+
+cor_mat <- cor(
+  X_scaled,
+  use = "pairwise.complete.obs",
+  method = "pearson"
+)
+
+# Для кластеризации переменных используем 1 - abs(r):
+# переменные считаются близкими, если дают похожую информацию,
+# даже если клиническое направление противоположное.
+cor_dist <- as.dist(1 - abs(cor_mat))
+cor_hclust <- hclust(cor_dist, method = "ward.D2")
+var_order <- cor_hclust$labels[cor_hclust$order]
+
+cor_long <- as.data.frame(as.table(cor_mat)) %>%
+  rename(
+    var1 = Var1,
+    var2 = Var2,
+    correlation = Freq
+  ) %>%
+  mutate(
+    var1 = factor(var1, levels = var_order),
+    var2 = factor(var2, levels = rev(var_order))
+  )
+
+ggplot(cor_long, aes(var1, var2, fill = correlation)) +
+  geom_tile() +
+  scale_fill_gradient2(
+    limits = c(-1, 1),
+    midpoint = 0,
+    name = "Pearson r"
+  ) +
+  coord_fixed() +
+  labs(
+    title = "Baseline numeric variables: correlation heatmap",
+    subtitle = "Selected skewed laboratory variables are log1p-transformed; two-sided 5% winsorization except selected scales, then scaled",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+```
+
+## PCA
+
+```{r}
+#| label: baseline-pca
+
+pca_fit <- prcomp(
+  X_scaled,
+  center = FALSE,
+  scale. = FALSE
+)
+
+pca_variance <- tibble(
+  PC = paste0("PC", seq_along(pca_fit$sdev)),
+  variance_explained = pca_fit$sdev^2 / sum(pca_fit$sdev^2),
+  cumulative_variance = cumsum(variance_explained)
+)
+
+pca_loadings <- as.data.frame(pca_fit$rotation) %>%
+  tibble::rownames_to_column("variable") %>%
+  left_join(
+    baseline_structure_vars %>% select(variable, label),
+    by = "variable"
+  )
+
+pca_scores <- as.data.frame(pca_fit$x) %>%
+  tibble::rownames_to_column("pat_record_id")
+
+pca_variance
+```
+
+## Scree plot
+
+```{r}
+#| label: baseline-pca-scree
+#| fig.width: 7
+#| fig.height: 4
+
+pca_variance %>%
+  slice_head(n = 10) %>%
+  mutate(PC = factor(PC, levels = PC)) %>%
+  ggplot(aes(PC, variance_explained)) +
+  geom_col() +
+  geom_line(aes(y = cumulative_variance, group = 1)) +
+  geom_point(aes(y = cumulative_variance)) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "Baseline PCA: explained variance",
+    subtitle = "PCA after selected log-transform, two-sided 5% winsorization, and scaling",
+    x = NULL,
+    y = "Explained variance"
+  ) +
+  theme_minimal()
+```
+
+## Loadings для первых компонент
+
+```{r}
+#| label: baseline-pca-loadings-table
+
+pca_top_loadings <- pca_loadings %>%
+  select(variable, label, PC1, PC2, PC3, PC4, PC5) %>%
+  pivot_longer(
+    cols = starts_with("PC"),
+    names_to = "PC",
+    values_to = "loading"
+  ) %>%
+  group_by(PC) %>%
+  slice_max(abs(loading), n = 8, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(PC, desc(abs(loading))) %>%
+  mutate(loading = round(loading, 3))
+
+pca_top_loadings
+```
+
+## Scatter PC1–PC2 с outcome как аннотацией
+
+```{r}
+#| label: baseline-pca-score-plot
+#| fig.width: 7
+#| fig.height: 5
+
+pca_scores_plot <- pca_scores %>%
+  left_join(
+    baseline_structure_annotations,
+    by = "pat_record_id"
+  )
+
+ggplot(pca_scores_plot, aes(PC1, PC2, color = outcome)) +
+  geom_point(size = 2, alpha = 0.8) +
+  labs(
+    title = "Patients in baseline PCA space",
+    subtitle = "Outcome is shown only as annotation; it was not used in PCA",
+    x = "PC1",
+    y = "PC2",
+    color = "Outcome"
+  ) +
+  theme_minimal()
+```
+
+## PCA biplot: пациенты + векторы переменных
+
+```{r}
+#| label: baseline-pca-biplot-vectors
+#| fig.width: 8
+#| fig.height: 6
+
+pca_scores_plot <- pca_scores %>%
+  left_join(
+    baseline_structure_annotations,
+    by = "pat_record_id"
+  )
+
+arrow_scale <- 0.75 * max(
+  abs(c(pca_scores_plot$PC1, pca_scores_plot$PC2)),
+  na.rm = TRUE
+) / max(
+  abs(c(pca_loadings$PC1, pca_loadings$PC2)),
+  na.rm = TRUE
+)
+
+pca_vectors <- pca_loadings %>%
+  mutate(
+    vector_strength = sqrt(PC1^2 + PC2^2),
+    PC1_arrow = PC1 * arrow_scale,
+    PC2_arrow = PC2 * arrow_scale
+  ) %>%
+  slice_max(vector_strength, n = 12, with_ties = FALSE)
+
+p_pca_biplot_vectors <- ggplot() +
+  geom_point(
+    data = pca_scores_plot,
+    aes(PC1, PC2, color = outcome),
+    size = 1.8,
+    alpha = 0.65
+  ) +
+  geom_segment(
+    data = pca_vectors,
+    aes(x = 0, y = 0, xend = PC1_arrow, yend = PC2_arrow),
+    arrow = arrow(length = unit(0.18, "cm")),
+    inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = pca_vectors,
+    aes(x = PC1_arrow, y = PC2_arrow, label = variable),
+    size = 3,
+    hjust = 0.5,
+    vjust = -0.4,
+    inherit.aes = FALSE
+  ) +
+  labs(
+    title = "Baseline PCA biplot",
+    subtitle = "Arrows show variables with the strongest contribution to PC1–PC2",
+    x = "PC1",
+    y = "PC2",
+    color = "Outcome"
+  ) +
+  theme_minimal()
+
+p_pca_biplot_vectors
+
+if (!exists("GRAPHES_DIR")) {
+  GRAPHES_DIR <- "graphes"
+}
+
+dir.create(GRAPHES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+ggsave(
+  filename = file.path(GRAPHES_DIR, "baseline_pca_biplot_vectors.svg"),
+  plot = p_pca_biplot_vectors,
+  width = 8,
+  height = 6,
+  units = "in"
+)
+
+ggsave(
+  filename = file.path(GRAPHES_DIR, "baseline_pca_biplot_vectors.pdf"),
+  plot = p_pca_biplot_vectors,
+  width = 8,
+  height = 6,
+  units = "in",
+  device = cairo_pdf
+)
+```
+
+## Связь PC scores с бинарными baseline-аннотациями
+
+```{r}
+#| label: baseline-pca-binary-annotation-summary
+
+pca_binary_annotation_summary <- pca_scores_plot %>%
+  select(pat_record_id, PC1, PC2, PC3, any_of(baseline_binary_annotation_vars)) %>%
+  pivot_longer(
+    cols = any_of(baseline_binary_annotation_vars),
+    names_to = "binary_variable",
+    values_to = "binary_value"
+  ) %>%
+  group_by(binary_variable, binary_value) %>%
+  summarise(
+    n = n(),
+    PC1_median = median(PC1, na.rm = TRUE),
+    PC2_median = median(PC2, na.rm = TRUE),
+    PC3_median = median(PC3, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(binary_variable, binary_value)
+
+pca_binary_annotation_summary
+```
+
+## Heatmap пациентов × переменных
+
+```{r}
+#| label: baseline-patient-variable-heatmap
+#| fig.width: 10
+#| fig.height: 10
+
+if (!requireNamespace("pheatmap", quietly = TRUE)) {
+  stop("Install pheatmap first: install.packages('pheatmap')")
+}
+
+annotation_row <- baseline_structure_annotations %>%
+  select(
+    pat_record_id,
+    any_of("outcome")
+  ) %>%
+  tibble::column_to_rownames("pat_record_id")
+
+annotation_row <- annotation_row[rownames(X_scaled), , drop = FALSE]
+
+# Отдельное ограничение цвета для читаемости heatmap.
+# Это не меняет PCA, только визуализацию.
+X_heatmap <- X_scaled
+X_heatmap[X_heatmap > 3] <- 3
+X_heatmap[X_heatmap < -3] <- -3
+
+p_baseline_heatmap <- pheatmap::pheatmap(
+  X_heatmap,
+  clustering_distance_rows = "euclidean",
+  clustering_method = "ward.D2",
+  clustering_distance_cols = cor_dist,
+  cluster_cols = cor_hclust,
+  annotation_row = annotation_row,
+  show_rownames = FALSE,
+  fontsize_col = 9,
+  main = "Baseline patient × variable heatmap, z capped at ±3",
+  silent = TRUE
+)
+
+grid::grid.newpage()
+grid::grid.draw(p_baseline_heatmap$gtable)
+
+if (!exists("GRAPHES_DIR")) {
+  GRAPHES_DIR <- "graphes"
+}
+
+dir.create(GRAPHES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+pdf(
+  file = file.path(GRAPHES_DIR, "baseline_patient_variable_heatmap.pdf"),
+  width = 10,
+  height = 10,
+  useDingbats = FALSE
+)
+grid::grid.draw(p_baseline_heatmap$gtable)
+dev.off()
+
+png(
+  filename = file.path(GRAPHES_DIR, "baseline_patient_variable_heatmap.png"),
+  width = 10,
+  height = 10,
+  units = "in",
+  res = 300
+)
+grid::grid.draw(p_baseline_heatmap$gtable)
+dev.off()
+```
+
+## Отдельная combined heatmap: numeric + binary baseline-показатели, percentile scale
+
+```{r}
+#| label: baseline-combined-numeric-binary-heatmap
+#| fig.width: 12
+#| fig.height: 10
+
+# Это отдельная heatmap, где numeric baseline-показатели и бинарные
+# baseline-показатели показаны в общей шкале 0–1.
+#
+# Numeric-показатели:
+#   подготовленные значения после log-transform / imputation / two-sided 5% winsorization
+#   переводятся в процентили через ecdf().
+#
+# Binary-показатели:
+#   приводятся к 0/1 и остаются в этой шкале:
+#     0 = признака нет
+#     1 = признак есть
+#
+# Кластеризация строк и столбцов:
+#   Manhattan distance + ward.D2, как в предложенном примере.
+#
+# Outcome остаётся только внешней аннотацией строки.
+
+if (!requireNamespace("ComplexHeatmap", quietly = TRUE)) {
+  stop("Install ComplexHeatmap first: BiocManager::install('ComplexHeatmap')")
+}
+
+if (!requireNamespace("circlize", quietly = TRUE)) {
+  stop("Install circlize first: install.packages('circlize')")
+}
+
+baseline_binary_heatmap_vars <- intersect(
+  c(
+    "ICU_6_month_history",
+    "is_bacteremic",
+    "is_pat_gram_plus",
+    "is_pat_gram_minus"
+  ),
+  names(patients_baseline_structure)
+)
+
+to_binary01 <- function(x) {
+  if (is.logical(x)) {
+    return(as.numeric(x))
+  }
+
+  if (is.numeric(x)) {
+    return(
+      dplyr::case_when(
+        is.na(x) ~ NA_real_,
+        x == 1 ~ 1,
+        x == 0 ~ 0,
+        TRUE ~ NA_real_
+      )
+    )
+  }
+
+  x_chr <- as.character(x)
+  x_chr <- stringr::str_to_lower(x_chr)
+  x_chr <- stringr::str_replace_all(x_chr, "\\u00A0", " ")
+  x_chr <- stringr::str_squish(x_chr)
+
+  dplyr::case_when(
+    x_chr %in% c(
+      "1", "true", "t", "yes", "y",
+      "да", "есть", "положительно", "положительный"
+    ) ~ 1,
+    x_chr %in% c(
+      "0", "false", "f", "no", "n",
+      "нет", "отсутствует", "отрицательно", "отрицательный"
+    ) ~ 0,
+    TRUE ~ NA_real_
+  )
+}
+
+to_percentile01 <- function(x) {
+  x <- as.numeric(x)
+  out <- rep(NA_real_, length(x))
+  ok <- !is.na(x)
+
+  if (sum(ok) == 0) {
+    return(out)
+  }
+
+  if (length(unique(x[ok])) == 1) {
+    out[ok] <- 0.5
+    return(out)
+  }
+
+  out[ok] <- ecdf(x[ok])(x[ok])
+  out
+}
+
+# Numeric-матрица для combined heatmap:
+# берём уже подготовленную baseline_numeric_matrix:
+# log-transform + median imputation + two-sided 5% winsorization.
+numeric_quantile_df <- baseline_numeric_matrix %>%
+  select(pat_record_id, all_of(structure_vars_used)) %>%
+  mutate(
+    across(
+      all_of(structure_vars_used),
+      to_percentile01
+    )
+  )
+
+numeric_quantile_mat <- numeric_quantile_df %>%
+  select(-pat_record_id) %>%
+  as.matrix()
+
+rownames(numeric_quantile_mat) <- numeric_quantile_df$pat_record_id
+
+if (length(baseline_binary_heatmap_vars) == 0) {
+  X_combined_heatmap <- numeric_quantile_mat
+
+  baseline_binary_heatmap_qc <- tibble(
+    variable = character(),
+    n_present = integer(),
+    n_absent = integer(),
+    n_missing = integer(),
+    prop_present = numeric()
+  )
+
+} else {
+
+  baseline_binary_heatmap_raw <- patients_baseline_structure %>%
+    select(
+      pat_record_id,
+      all_of(baseline_binary_heatmap_vars)
+    ) %>%
+    mutate(
+      across(
+        all_of(baseline_binary_heatmap_vars),
+        to_binary01
+      )
+    )
+
+  baseline_binary_heatmap_qc <- baseline_binary_heatmap_raw %>%
+    summarise(
+      across(
+        all_of(baseline_binary_heatmap_vars),
+        list(
+          n_present = ~ sum(.x == 1, na.rm = TRUE),
+          n_absent = ~ sum(.x == 0, na.rm = TRUE),
+          n_missing = ~ sum(is.na(.x)),
+          prop_present = ~ mean(.x == 1, na.rm = TRUE)
+        ),
+        .names = "{.col}__{.fn}"
+      )
+    ) %>%
+    pivot_longer(
+      everything(),
+      names_to = c("variable", ".value"),
+      names_sep = "__"
+    ) %>%
+    arrange(variable)
+
+  binary_quantile_mat <- baseline_binary_heatmap_raw %>%
+    select(-pat_record_id) %>%
+    as.matrix()
+
+  rownames(binary_quantile_mat) <- baseline_binary_heatmap_raw$pat_record_id
+
+  # Строки бинарной матрицы приводим к тому же порядку пациентов,
+  # что и numeric-матрица.
+  binary_quantile_mat <- binary_quantile_mat[
+    rownames(numeric_quantile_mat),
+    ,
+    drop = FALSE
+  ]
+
+  # Склеиваем numeric-процентили и binary 0/1 по столбцам.
+  X_combined_heatmap <- cbind(
+    numeric_quantile_mat,
+    binary_quantile_mat
+  )
+}
+
+print(baseline_binary_heatmap_qc)
+
+# Для кластеризации NA заменяем нейтральным значением 0.5.
+# Это не меняет отображение: на самой heatmap NA останутся серыми.
+X_combined_for_clustering <- X_combined_heatmap
+X_combined_for_clustering[is.na(X_combined_for_clustering)] <- 0.5
+
+annotation_row_combined <- baseline_structure_annotations %>%
+  select(
+    pat_record_id,
+    any_of("outcome")
+  )
+
+annotation_row_combined <- annotation_row_combined[
+  match(rownames(X_combined_heatmap), annotation_row_combined$pat_record_id),
+  ,
+  drop = FALSE
+]
+
+outcome_values <- annotation_row_combined$outcome
+names(outcome_values) <- annotation_row_combined$pat_record_id
+
+outcome_levels <- outcome_values %>%
+  as.character() %>%
+  na.omit() %>%
+  unique()
+
+outcome_palette <- c(
+  "#7CAE00",
+  "#F8766D",
+  "#00BFC4",
+  "#C77CFF",
+  "#A3A500",
+  "#00BF7D",
+  "#E76BF3"
+)
+
+outcome_colors <- outcome_palette[seq_along(outcome_levels)]
+names(outcome_colors) <- outcome_levels
+
+row_ha <- ComplexHeatmap::rowAnnotation(
+  outcome = outcome_values,
+  col = list(outcome = outcome_colors),
+  show_annotation_name = TRUE
+)
+
+col_fun <- circlize::colorRamp2(
+  c(0, 1),
+  c("#ffffff", "#1f4e79")
+)
+
+p_baseline_combined_heatmap <- ComplexHeatmap::Heatmap(
+  X_combined_heatmap,
+  name = "Percentile / binary",
+  col = col_fun,
+  na_col = "grey85",
+
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  clustering_distance_rows = "manhattan",
+  clustering_distance_columns = "manhattan",
+  clustering_method_rows = "ward.D2",
+  clustering_method_columns = "ward.D2",
+
+  left_annotation = row_ha,
+  show_row_names = FALSE,
+  show_column_names = TRUE,
+  column_names_gp = grid::gpar(fontsize = 8),
+  column_names_rot = 90,
+
+  row_title = "Patients",
+  column_title = "Baseline variables: numeric percentiles + binary indicators",
+  rect_gp = grid::gpar(col = "grey85", lwd = 0.2)
+)
+
+ComplexHeatmap::draw(
+  p_baseline_combined_heatmap,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right"
+)
+
+dir.create(GRAPHES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+grDevices::cairo_pdf(
+  filename = file.path(
+    GRAPHES_DIR,
+    "baseline_patient_variable_heatmap_numeric_binary_percentile_manhattan.pdf"
+  ),
+  width = 12,
+  height = 10
+)
+ComplexHeatmap::draw(
+  p_baseline_combined_heatmap,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right"
+)
+dev.off()
+
+png(
+  filename = file.path(
+    GRAPHES_DIR,
+    "baseline_patient_variable_heatmap_numeric_binary_percentile_manhattan.png"
+  ),
+  width = 12,
+  height = 10,
+  units = "in",
+  res = 300
+)
+ComplexHeatmap::draw(
+  p_baseline_combined_heatmap,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right"
+)
+dev.off()
+```
+
+## Кластеры пациентов
+
+```{r}
+#| label: baseline-patient-clusters
+
+# Для patient clusters используем матрицу после log-transform, two-sided 5% winsorization и scaling.
+patient_dist <- dist(X_scaled, method = "manhattan")
+patient_hclust <- hclust(patient_dist, method = "ward.D2")
+
+patient_clusters <- tibble(
+  pat_record_id = rownames(X_scaled),
+  baseline_cluster_2 = factor(cutree(patient_hclust, k = 2)),
+  baseline_cluster_3 = factor(cutree(patient_hclust, k = 3)),
+  baseline_cluster_4 = factor(cutree(patient_hclust, k = 4))
+)
+
+patients_baseline_with_clusters <- patients_baseline_structure_annotated %>%
+  left_join(patient_clusters, by = "pat_record_id")
+```
+
+## Первичная описательная таблица кластеров
+
+```{r}
+#| label: baseline-cluster-summary
+
+patients_baseline_with_clusters %>%
+  group_by(baseline_cluster_3) %>%
+  summarise(
+    n = n(),
+    mortality_n = sum(outcome_logit_num == 1, na.rm = TRUE),
+    mortality_prop = mean(outcome_logit_num == 1, na.rm = TRUE),
+    SOFA_median = median(SOFA, na.rm = TRUE),
+    VIS2020_median = median(VIS2020, na.rm = TRUE),
+    lactate_median = median(lactate, na.rm = TRUE),
+    PaFiO2_calc_median = median(PaFiO2_calc, na.rm = TRUE),
+    icu_to_HA1_hours_median = median(icu_to_HA1_hours, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+## Проверка выбросов после log-transform, до TRIM
+
+```{r}
+#| label: baseline-structure-extreme-values
+
+X_scaled_untrimmed_for_qc <- scale(X_untrimmed)
+
+extreme_values <- as.data.frame(X_scaled_untrimmed_for_qc) %>%
+  tibble::rownames_to_column("pat_record_id") %>%
+  tidyr::pivot_longer(
+    cols = -pat_record_id,
+    names_to = "variable",
+    values_to = "z_value"
+  ) %>%
+  arrange(desc(abs(z_value))) %>%
+  slice_head(n = 50)
+
+extreme_values
+```
+
+## Исходные значения выбросов
+
+```{r}
+#| label: baseline-structure-extreme-raw-values
+
+extreme_raw_values <- extreme_values %>%
+  mutate(
+    raw_value = purrr::map2_chr(
+      pat_record_id,
+      variable,
+      ~ patients_baseline_structure %>%
+        filter(pat_record_id == .x) %>%
+        pull(.y) %>%
+        as.character()
+    )
+  ) %>%
+  left_join(
+    baseline_structure_vars %>%
+      select(variable, label),
+    by = "variable"
+  ) %>%
+  left_join(
+    trim_qc %>% select(variable, use_log1p, trim_lower_value, trim_upper_value),
+    by = "variable"
+  ) %>%
+  select(
+    pat_record_id,
+    variable,
+    label,
+    z_value,
+    raw_value,
+    use_log1p,
+    trim_lower_value,
+    trim_upper_value
+  )
+
+extreme_raw_values
 ```
 
 # Проверка PaFiO2 и фибриноген
@@ -2419,8 +3702,7 @@ tbl_regression(
     `I(icu_to_HA1_hours/5)` ~ "Время между поступлением в ОРИТ и началом ГС (на 5 ч)",
     SOFA ~ "SOFA",
     `SOFA:I(icu_to_HA1_hours/5)` ~ "Взаимодействие: SOFA × время до начала ГС",
-    age_yr ~ "Возраст (полных лет)",
-    first_sorption_type ~ "Тип первой сорбции (Гемоперфузия 1)"
+    age_yr ~ "Возраст (полных лет)" ~ "Тип первой сорбции (Гемоперфузия 1)"
   )
 ) %>%
   bold_labels()
@@ -2431,8 +3713,7 @@ type_ref <- names(sort(table(df_logit_type$first_sorption_type), decreasing = TR
 p_type <- tibble(
   icu_to_HA1_hours = c(0, 1, 3, 5),
   SOFA = median(df_logit_type$SOFA, na.rm = TRUE),
-  age_yr = median(df_logit_type$age_yr, na.rm = TRUE),
-  first_sorption_type = factor(type_ref, levels = levels(df_logit_type$first_sorption_type))
+  age_yr = median(df_logit_type$age_yr, na.rm = TRUE) = factor(type_ref, levels = levels(df_logit_type$first_sorption_type))
 ) %>%
   mutate(
     p_death = predict(model_logit_type, newdata = ., type = "response"),
@@ -4312,8 +5593,7 @@ vars_base <- c(
 tbl_base <- pt0 %>%
   select(any_of(vars_base)) %>%
   tbl_summary(
-    by = first_sorption_type,
-    type = list(
+    by = type = list(
       age_yr ~ "continuous",
       icu_to_HA1_hours ~ "continuous",
       SOFA ~ "continuous",
@@ -4353,7 +5633,6 @@ tbl_indications <- NULL
 if ("is_septic" %in% names(pt0)) {
   pt0_septic <- pt0 %>%
     transmute(
-      first_sorption_type,
       is_septic_cat = factor(
         dplyr::case_when(
           is_septic == 1 ~ "Септические",
@@ -4366,8 +5645,7 @@ if ("is_septic" %in% names(pt0)) {
 
   tbl_indications <- pt0_septic %>%
     tbl_summary(
-      by = first_sorption_type,
-      type = list(is_septic_cat ~ "categorical"),
+      by = type = list(is_septic_cat ~ "categorical"),
       statistic = list(all_categorical() ~ "{n} ({p}%)"),
       label = list(is_septic_cat = "Септические / асептические"),
       missing = "no"
@@ -4388,8 +5666,7 @@ if ("pat_gram_stain" %in% names(pt0)) {
     tbl_path <- pt0_path %>%
       select(first_sorption_type, pat_gram_stain_slide) %>%
       tbl_summary(
-        by = first_sorption_type,
-        type = all_categorical() ~ "categorical",
+        by = type = all_categorical() ~ "categorical",
         statistic = all_categorical() ~ "{n} ({p}%)",
         label = list(pat_gram_stain_slide = "Бактериальная флора по Граму"),
         missing = "no"
@@ -4765,8 +6042,7 @@ out_df <- out_df %>%
 tbl4 <- out_df %>%
 select(first_sorption_type, time_to_icu_discharge_h, CGI_E_2lvl, SOFA_drop_2plus, VIS_drop_20plus, mortality) %>%
 tbl_summary(
-  by = first_sorption_type,
-  type = list(
+  by = type = list(
     CGI_E_2lvl ~ "dichotomous",
     SOFA_drop_2plus ~ "dichotomous",
     VIS_drop_20plus ~ "dichotomous",
