@@ -1,0 +1,547 @@
+---
+title: "2Reg — QC времени начала антибиотикотерапии"
+lang: ru
+format:
+  html:
+    toc: true
+    toc-title: "Содержание"
+    number-sections: true
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: false
+---
+
+# Правила QC
+
+- Интервал считается в календарных днях: начало АБ → индексная точка.
+- `0 дней` означает только совпадение календарной даты; часы не сравниваются.
+- Отрицательный интервал, отсутствие даты и интервал >14 дней помечаются для проверки, но не исправляются и не исключаются автоматически.
+
+# Подготовка данных
+
+```{r}
+#| label: setup
+#| include: false
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(stringr)
+  library(tibble)
+  library(lubridate)
+  library(ggplot2)
+  library(openxlsx)
+})
+
+source("R/analysis_helpers.R")
+
+DATA_DIR <- "data"
+ANALYSIS_DATA_DIR <- file.path(DATA_DIR, "analysis")
+REPORT_TZ <- "UTC"
+LONG_INTERVAL_DAYS <- 14L
+
+dir.create(ANALYSIS_DATA_DIR, showWarnings = FALSE, recursive = TRUE)
+
+patients_rds <- pick_path(c(
+  file.path(DATA_DIR, "patients_tidy.rds"),
+  file.path("/mnt/data", DATA_DIR, "patients_tidy.rds"),
+  "patients_tidy.rds"
+))
+
+control_rds <- pick_path(c(
+  file.path(DATA_DIR, "control_tidy.rds"),
+  file.path("/mnt/data", DATA_DIR, "control_tidy.rds"),
+  "control_tidy.rds"
+))
+
+patients_tidy <- readRDS(patients_rds)
+control_tidy <- readRDS(control_rds)
+
+required_cols <- c(
+  "pat_record_id", "timepoint", "record_author",
+  "antibiotics_start_datetime_raw", "antibiotics_start_dt",
+  "clin_assess_date_raw", "clin_assess_dt", "ICU_in_dt",
+  "first_sorption_dt", "first_sorption_type", "ICU_to_antibiotics_dt"
+)
+
+assert_columns(patients_tidy, required_cols, "patients_tidy")
+assert_columns(control_tidy, required_cols, "control_tidy")
+
+group_levels <- c("Контроль", "LPS", "CT")
+tp_levels <- c("m12h_0h", "48h_72h", "4d_6d", "7d_10d")
+tp_labels <- c(
+  m12h_0h = "−12–0 ч",
+  `48h_72h` = "48–72 ч",
+  `4d_6d` = "4–6 суток",
+  `7d_10d` = "7–10 суток"
+)
+
+first_not_na <- function(x) {
+  idx <- which(!is.na(x))
+  if (length(idx)) x[idx[1]] else x[NA_integer_]
+}
+
+has_explicit_time <- function(x) {
+  x <- as.character(x)
+  if_else(
+    is.na(x),
+    NA,
+    str_detect(x, "(?:T|\\s)\\d{1,2}:\\d{2}")
+  )
+}
+
+format_dt <- function(x) {
+  if_else(
+    is.na(x),
+    NA_character_,
+    format(x, "%Y-%m-%d %H:%M", tz = REPORT_TZ)
+  )
+}
+```
+
+```{r}
+#| label: build-qc-data
+#| include: false
+
+treated_rows <- patients_tidy %>%
+  filter(first_sorption_type %in% c("LPS", "CT")) %>%
+  transmute(
+    pat_record_id,
+    comparison_group = as.character(first_sorption_type),
+    timepoint = as.character(timepoint),
+    record_author,
+    antibiotics_start_datetime_raw,
+    antibiotics_start_dt,
+    clin_assess_date_raw,
+    clin_assess_dt,
+    ICU_in_dt,
+    first_sorption_dt,
+    ICU_to_antibiotics_dt
+  )
+
+control_rows <- control_tidy %>%
+  transmute(
+    pat_record_id,
+    comparison_group = "Контроль",
+    timepoint = as.character(timepoint),
+    record_author,
+    antibiotics_start_datetime_raw,
+    antibiotics_start_dt,
+    clin_assess_date_raw,
+    clin_assess_dt,
+    ICU_in_dt,
+    first_sorption_dt,
+    ICU_to_antibiotics_dt
+  )
+
+comparison_rows <- bind_rows(treated_rows, control_rows) %>%
+  mutate(
+    comparison_group = factor(comparison_group, levels = group_levels),
+    timepoint = factor(timepoint, levels = tp_levels, ordered = TRUE)
+  ) %>%
+  distinct(pat_record_id, comparison_group, timepoint, .keep_all = TRUE)
+
+control_index <- comparison_rows %>%
+  filter(comparison_group == "Контроль", timepoint == "m12h_0h") %>%
+  distinct(pat_record_id, .keep_all = TRUE)
+
+treated_index <- comparison_rows %>%
+  filter(
+    comparison_group %in% c("LPS", "CT"),
+    !is.na(clin_assess_dt),
+    !is.na(first_sorption_dt),
+    clin_assess_dt <= first_sorption_dt
+  ) %>%
+  group_by(pat_record_id, comparison_group) %>%
+  slice_max(clin_assess_dt, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+index_rows <- bind_rows(control_index, treated_index) %>%
+  transmute(
+    pat_record_id,
+    comparison_group,
+    index_timepoint = as.character(timepoint),
+    index_date_raw = clin_assess_date_raw,
+    index_dt = clin_assess_dt
+  )
+
+patient_static <- comparison_rows %>%
+  arrange(pat_record_id, timepoint) %>%
+  group_by(pat_record_id, comparison_group) %>%
+  summarise(
+    record_author = first_not_na(record_author),
+    antibiotics_start_datetime_raw = first_not_na(
+      antibiotics_start_datetime_raw
+    ),
+    antibiotics_start_dt = first_not_na(antibiotics_start_dt),
+    ICU_in_dt = first_not_na(ICU_in_dt),
+    first_sorption_dt = first_not_na(first_sorption_dt),
+    ICU_to_antibiotics_dt = first_not_na(ICU_to_antibiotics_dt),
+    .groups = "drop"
+  )
+
+category_levels <- c(
+  "Нет одной из дат",
+  "АБ позже индексной точки",
+  "0 дней",
+  "1 день",
+  "2–7 дней",
+  "8–14 дней",
+  "15–30 дней",
+  ">30 дней"
+)
+
+antibiotics_qc <- patient_static %>%
+  left_join(
+    index_rows,
+    by = c("pat_record_id", "comparison_group")
+  ) %>%
+  mutate(
+    index_has_time = has_explicit_time(index_date_raw),
+    antibiotics_has_time = has_explicit_time(
+      antibiotics_start_datetime_raw
+    ),
+    interval_hours = as.numeric(
+      difftime(index_dt, antibiotics_start_dt, units = "hours")
+    ),
+    interval_calendar_days = as.numeric(
+      as.Date(index_dt, tz = REPORT_TZ) -
+        as.Date(antibiotics_start_dt, tz = REPORT_TZ)
+    ),
+    interval_category = case_when(
+      is.na(index_dt) | is.na(antibiotics_start_dt) ~ "Нет одной из дат",
+      interval_calendar_days < 0 ~ "АБ позже индексной точки",
+      interval_calendar_days == 0 ~ "0 дней",
+      interval_calendar_days == 1 ~ "1 день",
+      interval_calendar_days <= 7 ~ "2–7 дней",
+      interval_calendar_days <= LONG_INTERVAL_DAYS ~ "8–14 дней",
+      interval_calendar_days <= 30 ~ "15–30 дней",
+      TRUE ~ ">30 дней"
+    ),
+    interval_category = factor(
+      interval_category,
+      levels = category_levels
+    ),
+    review_required =
+      is.na(index_dt) |
+      is.na(antibiotics_start_dt) |
+      interval_calendar_days < 0 |
+      interval_calendar_days > LONG_INTERVAL_DAYS,
+    qc_status = case_when(
+      is.na(index_dt) & is.na(antibiotics_start_dt) ~
+        "Проверить: отсутствуют обе даты",
+      is.na(index_dt) ~ "Проверить: нет индексной даты",
+      is.na(antibiotics_start_dt) ~ "Проверить: нет даты начала АБ",
+      interval_calendar_days < 0 ~ "Проверить порядок дат",
+      interval_calendar_days > LONG_INTERVAL_DAYS ~
+        "Проверить длительный интервал",
+      interval_calendar_days == 0 ~
+        "Без явной ошибки; часы неизвестны",
+      TRUE ~ "Без явной ошибки"
+    ),
+    comparison_group = factor(comparison_group, levels = group_levels),
+    index_timepoint_label = unname(tp_labels[index_timepoint])
+  )
+
+saveRDS(
+  antibiotics_qc,
+  file.path(ANALYSIS_DATA_DIR, "antibiotics_timing_qc.rds")
+)
+```
+
+# Точность исходных дат
+
+```{r}
+#| label: date-precision
+
+date_precision_summary <- antibiotics_qc %>%
+  group_by(comparison_group) %>%
+  summarise(
+    `Пациенты, n` = n(),
+    `Есть обе даты, n` = sum(!is.na(index_dt) & !is.na(antibiotics_start_dt)),
+    `Индекс с точным временем, n` = sum(index_has_time %in% TRUE),
+    `АБ с точным временем, n` = sum(antibiotics_has_time %in% TRUE),
+    `Требуют проверки, n` = sum(review_required),
+    .groups = "drop"
+  ) %>%
+  rename(`Группа` = comparison_group)
+
+knitr::kable(date_precision_summary, align = "lrrrrr")
+```
+
+Время индексной оценки отсутствует в исходной форме. Поэтому интервалы в часах
+не используются для QC; сравниваются календарные даты.
+
+# Распределение интервалов
+
+## Начало АБ → индексная точка
+
+```{r}
+#| label: category-summary
+
+category_summary <- antibiotics_qc %>%
+  count(comparison_group, interval_category, name = "n", .drop = FALSE) %>%
+  group_by(comparison_group) %>%
+  mutate(percent = 100 * n / sum(n)) %>%
+  ungroup()
+
+category_summary %>%
+  transmute(
+    `Группа` = comparison_group,
+    `Интервал` = interval_category,
+    `n` = n,
+    `%` = round(percent, 1)
+  ) %>%
+  knitr::kable(align = "llrr")
+```
+
+```{r}
+#| label: category-plot
+#| fig-width: 11
+#| fig-height: 5.5
+
+category_plot <- category_summary %>%
+  ggplot(
+    aes(
+      x = comparison_group,
+      y = percent / 100,
+      fill = interval_category
+    )
+  ) +
+  geom_col(width = 0.65, colour = "white", linewidth = 0.25) +
+  geom_text(
+    aes(label = if_else(percent >= 6, paste0(round(percent), "%"), "")),
+    position = position_stack(vjust = 0.5),
+    size = 3.2
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.01))
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Нет одной из дат" = "#B8B8B8",
+      "АБ позже индексной точки" = "#C94C4C",
+      "0 дней" = "#4E9F6D",
+      "1 день" = "#72A9CF",
+      "2–7 дней" = "#9CC7E3",
+      "8–14 дней" = "#E7BE6A",
+      "15–30 дней" = "#D98C4A",
+      ">30 дней" = "#8E6BB3"
+    ),
+    drop = FALSE
+  ) +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Доля пациентов",
+    fill = "Начало АБ → индексная точка",
+    caption = "0 дней означает совпадение календарной даты, а не точного времени."
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    panel.grid.major.y = element_blank()
+  )
+
+category_plot
+```
+
+## Поступление в ОРИТ → начало АБ
+
+```{r}
+#| label: icu-to-antibiotics-category-plot
+#| fig-width: 11
+#| fig-height: 5.5
+
+icu_to_antibiotics_levels <- c(
+  "Нет одной из дат",
+  "До ОРИТ: >30 дней",
+  "До ОРИТ: 15–30 дней",
+  "До ОРИТ: 8–14 дней",
+  "До ОРИТ: 2–7 дней",
+  "До ОРИТ: 1 день",
+  "До ОРИТ: тот же день",
+  "0 дней",
+  "1 день",
+  "2–7 дней",
+  "8–14 дней",
+  "15–30 дней",
+  ">30 дней"
+)
+
+icu_to_antibiotics_summary <- antibiotics_qc %>%
+  mutate(
+    ICU_to_antibiotics_calendar_days = as.numeric(
+      as.Date(antibiotics_start_dt, tz = REPORT_TZ) -
+        as.Date(ICU_in_dt, tz = REPORT_TZ)
+    ),
+    ICU_to_antibiotics_category = case_when(
+      is.na(ICU_to_antibiotics_dt) ~ "Нет одной из дат",
+      ICU_to_antibiotics_dt < 0 &
+        ICU_to_antibiotics_calendar_days == 0 ~ "До ОРИТ: тот же день",
+      ICU_to_antibiotics_calendar_days == -1 ~ "До ОРИТ: 1 день",
+      dplyr::between(
+        ICU_to_antibiotics_calendar_days, -7, -2
+      ) ~ "До ОРИТ: 2–7 дней",
+      dplyr::between(
+        ICU_to_antibiotics_calendar_days, -14, -8
+      ) ~ "До ОРИТ: 8–14 дней",
+      dplyr::between(
+        ICU_to_antibiotics_calendar_days, -30, -15
+      ) ~ "До ОРИТ: 15–30 дней",
+      ICU_to_antibiotics_calendar_days < -30 ~ "До ОРИТ: >30 дней",
+      ICU_to_antibiotics_calendar_days == 0 ~ "0 дней",
+      ICU_to_antibiotics_calendar_days == 1 ~ "1 день",
+      ICU_to_antibiotics_calendar_days <= 7 ~ "2–7 дней",
+      ICU_to_antibiotics_calendar_days <= 14 ~ "8–14 дней",
+      ICU_to_antibiotics_calendar_days <= 30 ~ "15–30 дней",
+      TRUE ~ ">30 дней"
+    ),
+    ICU_to_antibiotics_category = factor(
+      ICU_to_antibiotics_category,
+      levels = icu_to_antibiotics_levels
+    )
+  ) %>%
+  count(
+    comparison_group,
+    ICU_to_antibiotics_category,
+    name = "n",
+    .drop = FALSE
+  ) %>%
+  group_by(comparison_group) %>%
+  mutate(percent = 100 * n / sum(n)) %>%
+  ungroup()
+
+icu_to_antibiotics_plot <- icu_to_antibiotics_summary %>%
+  ggplot(
+    aes(
+      x = comparison_group,
+      y = percent / 100,
+      fill = ICU_to_antibiotics_category
+    )
+  ) +
+  geom_col(width = 0.65, colour = "white", linewidth = 0.25) +
+  geom_text(
+    aes(label = if_else(percent >= 6, paste0(round(percent), "%"), "")),
+    position = position_stack(vjust = 0.5),
+    size = 3.2
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.01))
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Нет одной из дат" = "#B8B8B8",
+      "До ОРИТ: >30 дней" = "#7F1D1D",
+      "До ОРИТ: 15–30 дней" = "#991B1B",
+      "До ОРИТ: 8–14 дней" = "#B91C1C",
+      "До ОРИТ: 2–7 дней" = "#DC2626",
+      "До ОРИТ: 1 день" = "#EF4444",
+      "До ОРИТ: тот же день" = "#F87171",
+      "0 дней" = "#4E9F6D",
+      "1 день" = "#72A9CF",
+      "2–7 дней" = "#9CC7E3",
+      "8–14 дней" = "#E7BE6A",
+      "15–30 дней" = "#D98C4A",
+      ">30 дней" = "#8E6BB3"
+    ),
+    drop = FALSE
+  ) +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Доля пациентов",
+    fill = "Поступление в ОРИТ → начало АБ",
+    caption = paste0(
+      "Категории «до ОРИТ» рассчитаны по календарным датам; ",
+      "«тот же день» означает отрицательный интервал в часах при совпадении даты."
+    )
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    panel.grid.major.y = element_blank()
+  )
+
+icu_to_antibiotics_plot
+```
+
+# Записи для проверки
+
+```{r}
+#| label: review-cases
+
+review_cases <- antibiotics_qc %>%
+  filter(review_required) %>%
+  arrange(comparison_group, interval_calendar_days, pat_record_id)
+
+review_cases_display <- review_cases %>%
+  transmute(
+    `ID` = pat_record_id,
+    `Группа` = comparison_group,
+    `Врач` = record_author,
+    `Начало АБ, raw` = antibiotics_start_datetime_raw,
+    `Индексная дата, raw` = index_date_raw,
+    `Индексная точка` = index_timepoint_label,
+    `Дней` = interval_calendar_days,
+    `QC` = qc_status
+  )
+
+knitr::kable(review_cases_display, align = "llllllrl")
+```
+
+# Выгрузка QC
+
+```{r}
+#| label: save-qc
+#| include: false
+
+all_records_export <- antibiotics_qc %>%
+  transmute(
+    `ID` = pat_record_id,
+    `Группа` = comparison_group,
+    `Врач` = record_author,
+    `Поступление в ОРИТ` = format_dt(ICU_in_dt),
+    `Начало АБ, raw` = antibiotics_start_datetime_raw,
+    `Начало АБ` = format_dt(antibiotics_start_dt),
+    `Индексная дата, raw` = index_date_raw,
+    `Индексная дата` = format_dt(index_dt),
+    `Индексная точка` = index_timepoint_label,
+    `Первая сорбция` = format_dt(first_sorption_dt),
+    `Интервал, календарных дней` = interval_calendar_days,
+    `Интервал, часов (технически)` = interval_hours,
+    `Требует проверки` = if_else(review_required, "Да", "Нет"),
+    `QC` = qc_status
+  )
+
+openxlsx::write.xlsx(
+  list(
+    `Точность дат` = date_precision_summary,
+    `Категории` = category_summary %>%
+      transmute(
+        `Группа` = comparison_group,
+        `Интервал` = interval_category,
+        `n` = n,
+        `%` = round(percent, 1)
+      ),
+    `Спорные записи` = review_cases_display,
+    `Все записи` = all_records_export
+  ),
+  file.path(ANALYSIS_DATA_DIR, "2Reg_QC_antibiotics_timing.xlsx"),
+  asTable = TRUE,
+  overwrite = TRUE
+)
+```
+
+Созданные файлы:
+
+- `data/analysis/antibiotics_timing_qc.rds`;
+- `data/analysis/2Reg_QC_antibiotics_timing.xlsx`.

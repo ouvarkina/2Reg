@@ -1,0 +1,720 @@
+---
+title: "2Reg — severity ranks and numeric outcome (old logic)"
+format:
+  html:
+    toc: true
+    number-sections: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+# Входные данные и предварительные условия
+
+Необходимые входные данные ETL:
+
+data/patients_tidy.rds
+
+Дополнительный источник настроек:
+
+Google-таблица Dictionary — правила для baseline-rank и градации силы ассоциаций.
+
+Файл не изменяет и не перезаписывает patients_tidy.rds.
+
+
+# Setup
+
+```{r}
+#| label: setup
+#| include: false
+#| cache: false
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(tibble)
+  library(purrr)
+  library(openxlsx)
+  library(googlesheets4)
+})
+
+source("R/analysis_helpers.R")
+
+DATA_DIR <- "data"
+ANALYSIS_DATA_DIR <- file.path(DATA_DIR, "analysis")
+TABLES_DIR <- "tables"
+
+dir.create(ANALYSIS_DATA_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(TABLES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+patients_rds <- pick_path(c(
+  file.path(DATA_DIR, "patients_tidy.rds"),
+  file.path("/mnt/data", DATA_DIR, "patients_tidy.rds"),
+  "patients_tidy.rds"
+))
+
+patients_tidy <- readRDS(patients_rds)
+
+baseline_timepoint_for_ranks <- "m12h_0h"
+baseline_redundancy_method <- "row_sum_r2"
+
+dictionary_url <- "https://docs.google.com/spreadsheets/d/1bsOuvblNg1l3tNiAV8Se_Kf4_IcQjsRtxISyNzoQqLw/edit"
+dictionary_sheet <- "Dictionary"
+
+to_num <- num_from_any
+```
+
+# Build baseline severity ranks
+
+```{r}
+#| label: baseline-severity-ranks
+required_rank_cols <- c("pat_record_id", "timepoint")
+missing_rank_cols <- setdiff(required_rank_cols, names(patients_tidy))
+if (length(missing_rank_cols) > 0) {
+  stop("Для расчета baseline ranks в patients_tidy нет колонок: ",
+       paste(missing_rank_cols, collapse = ", "))
+}
+
+clean_text_rank <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_replace_all(x, "\\u00A0", " ")
+  x <- stringr::str_squish(x)
+  x[x == ""] <- NA_character_
+  x
+}
+
+clean_choice_rank <- function(x) {
+  stringr::str_to_lower(clean_text_rank(x))
+}
+
+normalise_category_rank <- function(x) {
+  x <- clean_choice_rank(x)
+  # В референсной ячейке допускаем комментарий в скобках после уровня.
+  # Например: "ж (если используется как ковариата)" -> "ж".
+  x <- sub("\\s*\\(.*$", "", x)
+  stringr::str_squish(x)
+}
+
+normalise_reference_levels_rank <- function(x) {
+  x <- normalise_category_rank(x)
+  if (length(x) != 1L || is.na(x) || !nzchar(x)) return(NA_character_)
+  levels <- trimws(strsplit(x, "|", fixed = TRUE)[[1]])
+  levels <- levels[nzchar(levels)]
+  if (length(levels) == 0L) return(NA_character_)
+  paste(unique(levels), collapse = "|")
+}
+
+is_reference_level_rank <- function(value, reference_levels) {
+  if (length(value) != 1L || length(reference_levels) != 1L ||
+      is.na(value) || is.na(reference_levels)) {
+    return(FALSE)
+  }
+  value %in% strsplit(reference_levels, "|", fixed = TRUE)[[1]]
+}
+
+is_nonclinical_category_rank <- function(value) {
+  value %in% c(
+    "n/a", "na", "неизвестно", "нет данных",
+    "не оценивалось", "не оценивалось/нет данных",
+    "посев не проводился", "unknown", "missing"
+  )
+}
+
+parse_numeric_reference_rank <- function(x) {
+  empty_rule <- function() {
+    tibble::tibble(
+      rule_type = NA_character_,
+      lower_optimum = NA_real_,
+      upper_optimum = NA_real_,
+      optimal_center = NA_real_
+    )
+  }
+  
+  x <- clean_text_rank(x)
+  if (length(x) != 1L || is.na(x) || !nzchar(x)) return(empty_rule())
+  
+  x <- stringr::str_replace_all(x, ",", ".")
+  numbers_text <- regmatches(
+    x,
+    gregexpr("\\d+(?:\\.\\d+)?", x, perl = TRUE)
+  )[[1]]
+  if (length(numbers_text) == 0L) return(empty_rule())
+  
+  numbers <- suppressWarnings(as.numeric(numbers_text))
+  numbers <- numbers[!is.na(numbers)]
+  
+  if (length(numbers) == 1L) {
+    return(tibble::tibble(
+      rule_type = "center",
+      lower_optimum = NA_real_,
+      upper_optimum = NA_real_,
+      optimal_center = numbers[1]
+    ))
+  }
+  
+  if (length(numbers) == 2L) {
+    return(tibble::tibble(
+      rule_type = "interval",
+      lower_optimum = min(numbers),
+      upper_optimum = max(numbers),
+      optimal_center = NA_real_
+    ))
+  }
+  
+  empty_rule()
+}
+
+options(gargle_oauth_cache = TRUE)
+googlesheets4::gs4_auth(email = TRUE, scopes = "spreadsheets.readonly")
+
+dictionary_raw <- googlesheets4::read_sheet(
+  ss = dictionary_url,
+  sheet = dictionary_sheet,
+  na = c("", "NA", "N/A")
+)
+
+required_dictionary_columns <- c(
+  "Название",
+  "Имя переменной",
+  "Тип переменной",
+  "Казуальный тип",
+  "Включать в baseline_rank_vars",
+  "Единица в датасете",
+  "Референсный уровень / уровень наименьшего риска",
+  "Сила ассоциации"
+)
+
+missing_dictionary_columns <- setdiff(required_dictionary_columns, names(dictionary_raw))
+if (length(missing_dictionary_columns) > 0) {
+  stop("В Google Dictionary отсутствуют колонки: ",
+       paste(missing_dictionary_columns, collapse = ", "))
+}
+
+baseline_candidates <- dictionary_raw %>%
+  dplyr::transmute(
+    variable = clean_text_rank(.data[["Имя переменной"]]),
+    label = clean_text_rank(.data[["Название"]]),
+    data_type = clean_choice_rank(.data[["Тип переменной"]]),
+    causal_type = clean_choice_rank(.data[["Казуальный тип"]]),
+    rank_flag = clean_choice_rank(.data[["Включать в baseline_rank_vars"]]),
+    unit = clean_text_rank(.data[["Единица в датасете"]]),
+    optimum_reference = clean_text_rank(
+      .data[["Референсный уровень / уровень наименьшего риска"]]
+    ),
+    association_strength = to_num(.data[["Сила ассоциации"]])
+  ) %>%
+  dplyr::filter(
+    causal_type == "baseline",
+    data_type %in% c("numeric", "binary", "factor"),
+    rank_flag == "да",
+    !is.na(variable)
+  )
+
+if (nrow(baseline_candidates) == 0L) {
+  stop("В Dictionary нет baseline-переменных с `Включать в baseline_rank_vars = Да`.")
+}
+
+invalid_association_strength <- baseline_candidates %>%
+  dplyr::filter(
+    is.na(association_strength) |
+      !is.finite(association_strength) |
+      association_strength < 0
+  )
+
+if (nrow(invalid_association_strength) > 0L) {
+  stop(
+    "Для всех baseline rank variables должна быть задана неотрицательная `Сила ассоциации`. Проверьте: ",
+    paste(invalid_association_strength$variable, collapse = ", ")
+  )
+}
+
+if (anyDuplicated(baseline_candidates$variable) > 0L) {
+  stop(
+    "В Dictionary есть дублирующиеся baseline rank rules для: ",
+    paste(unique(baseline_candidates$variable[duplicated(baseline_candidates$variable)]), collapse = ", ")
+  )
+}
+
+numeric_rules <- dplyr::bind_rows(
+  lapply(baseline_candidates$optimum_reference, parse_numeric_reference_rank)
+)
+
+rank_rules <- baseline_candidates %>%
+  dplyr::bind_cols(numeric_rules) %>%
+  dplyr::mutate(
+    reference_levels = vapply(
+      optimum_reference,
+      normalise_reference_levels_rank,
+      character(1)
+    ),
+    rule_type = dplyr::case_when(
+      data_type == "numeric" ~ rule_type,
+      data_type %in% c("binary", "factor") & !is.na(reference_levels) ~ "reference_level",
+      TRUE ~ NA_character_
+    ),
+    variable_exists = variable %in% names(patients_tidy)
+  )
+
+invalid_rank_rules <- rank_rules %>%
+  dplyr::filter(!variable_exists | is.na(rule_type))
+if (nrow(invalid_rank_rules) > 0L) {
+  stop(
+    "Проверьте ранжируемые переменные в Dictionary: ",
+    paste(
+      paste0(
+        invalid_rank_rules$variable,
+        " [reference: ",
+        dplyr::coalesce(invalid_rank_rules$optimum_reference, "<пусто>"),
+        "; exists: ", invalid_rank_rules$variable_exists, "]"
+      ),
+      collapse = ", "
+    )
+  )
+}
+
+mandatory_rank_vars <- c("SOFA", "VIS2020")
+missing_mandatory_ranks <- setdiff(mandatory_rank_vars, rank_rules$variable)
+if (length(missing_mandatory_ranks) > 0L) {
+  stop(
+    "SOFA и VIS2020 должны быть включены в baseline ranks. В Dictionary не хватает: ",
+    paste(missing_mandatory_ranks, collapse = ", ")
+  )
+}
+
+mandatory_bad_reference <- rank_rules %>%
+  dplyr::filter(variable %in% mandatory_rank_vars) %>%
+  dplyr::filter(data_type != "numeric" | optimum_reference != "0" | rule_type != "center")
+if (nrow(mandatory_bad_reference) > 0L) {
+  stop("Для SOFA и VIS2020 ожидается numeric reference = 0 в Dictionary.")
+}
+
+patients_baseline_for_ranks <- patients_tidy %>%
+  dplyr::filter(timepoint == baseline_timepoint_for_ranks, !is.na(pat_record_id))
+
+if (nrow(patients_baseline_for_ranks) == 0L) {
+  stop("Нет строк patients_tidy с timepoint == ", baseline_timepoint_for_ranks)
+}
+
+duplicate_rank_ids <- patients_baseline_for_ranks %>%
+  dplyr::count(pat_record_id, name = "n_rows") %>%
+  dplyr::filter(n_rows > 1L)
+if (nrow(duplicate_rank_ids) > 0L) {
+  stop(
+    "Для рангов найдено более одной baseline-строки на пациента. Примеры ID: ",
+    paste(head(duplicate_rank_ids$pat_record_id, 10L), collapse = ", ")
+  )
+}
+
+baseline_rank_long <- patients_baseline_for_ranks %>%
+  dplyr::select(pat_record_id, dplyr::all_of(rank_rules$variable)) %>%
+  tidyr::pivot_longer(
+    cols = -pat_record_id,
+    names_to = "variable",
+    values_to = "value",
+
+    # Ранжируем одновременно numeric, binary и factor variables.
+    # Поэтому приводим значения к общему текстовому типу здесь; ниже
+    # numeric variables отдельно конвертируются в numeric_value.
+    values_transform = list(value = as.character)
+  ) %>%
+  dplyr::left_join(rank_rules, by = "variable") %>%
+  dplyr::mutate(
+    numeric_value = suppressWarnings(as.numeric(as.character(value))),
+    category_value = normalise_category_rank(value),
+    category_is_nonclinical = is_nonclinical_category_rank(category_value),
+    category_is_reference = mapply(
+      is_reference_level_rank,
+      category_value,
+      reference_levels
+    ),
+    distance_to_optimum = dplyr::case_when(
+      data_type == "numeric" & is.na(numeric_value) ~ NA_real_,
+      data_type == "numeric" & rule_type == "interval" ~
+        pmax(lower_optimum - numeric_value, numeric_value - upper_optimum, 0),
+      data_type == "numeric" & rule_type == "center" ~
+        abs(numeric_value - optimal_center),
+      data_type %in% c("binary", "factor") &
+        (is.na(category_value) | category_is_nonclinical) ~ NA_real_,
+      data_type %in% c("binary", "factor") & category_is_reference ~ 0,
+      data_type %in% c("binary", "factor") ~ 1
+    )
+  ) %>%
+  dplyr::group_by(variable) %>%
+  dplyr::mutate(
+    severity_rank = dplyr::case_when(
+      is.na(distance_to_optimum) ~ NA_integer_,
+      distance_to_optimum == 0 ~ 0L,
+      TRUE ~ dplyr::dense_rank(dplyr::if_else(
+        distance_to_optimum > 0,
+        distance_to_optimum,
+        NA_real_
+      ))
+    )
+  ) %>%
+  dplyr::ungroup()
+
+baseline_rank_wide <- baseline_rank_long %>%
+  dplyr::select(pat_record_id, variable, severity_rank) %>%
+  tidyr::pivot_wider(
+    names_from = variable,
+    values_from = severity_rank,
+    names_glue = "{variable}_rank"
+  )
+
+# 13c. Redundancy weights and composite baseline severity index ---------
+#
+# Корреляции считаем между самими severity ranks, потому что именно эти
+# преобразованные компоненты затем суммируются в итоговом индексе.
+# Pearson correlation между уже ранжированными значениями оценивает
+# линейную связь на шкале рангов; знак не влияет, так как r возводится
+# в квадрат.
+#
+# Полуэвристический вес независимой информации:
+#   independent_information_j = 1 / sum_k(r_jk^2)
+# Диагональ r_jj = 1 включена.
+#
+# Итоговый вес переменной:
+#   composite_weight_j = independent_information_j * association_strength_j
+#
+# Итоговый индекс пациента:
+#   baseline_severity_index_i = sum_j(severity_rank_ij * composite_weight_j)
+
+if (!identical(baseline_redundancy_method, "row_sum_r2")) {
+  stop(
+    "Пока поддерживается baseline_redundancy_method = `row_sum_r2`. Получено: ",
+    baseline_redundancy_method
+  )
+}
+
+baseline_rank_matrix <- baseline_rank_long %>%
+  dplyr::select(pat_record_id, variable, severity_rank) %>%
+  tidyr::pivot_wider(
+    names_from = variable,
+    values_from = severity_rank
+  ) %>%
+  dplyr::select(
+    pat_record_id,
+    dplyr::all_of(rank_rules$variable)
+  )
+
+rank_variable_qc <- tibble::tibble(
+  variable = rank_rules$variable,
+  n_observed = vapply(
+    baseline_rank_matrix[rank_rules$variable],
+    function(x) sum(!is.na(x)),
+    integer(1)
+  ),
+  n_unique_observed = vapply(
+    baseline_rank_matrix[rank_rules$variable],
+    function(x) dplyr::n_distinct(x[!is.na(x)]),
+    integer(1)
+  )
+) %>%
+  dplyr::mutate(
+    usable_for_redundancy = n_observed >= 3L & n_unique_observed >= 2L
+  )
+
+usable_rank_variables <- rank_variable_qc %>%
+  dplyr::filter(usable_for_redundancy) %>%
+  dplyr::pull(variable)
+
+baseline_rank_cor_matrix <- matrix(
+  NA_real_,
+  nrow = nrow(rank_rules),
+  ncol = nrow(rank_rules),
+  dimnames = list(rank_rules$variable, rank_rules$variable)
+)
+
+baseline_rank_pairwise_n <- matrix(
+  0L,
+  nrow = nrow(rank_rules),
+  ncol = nrow(rank_rules),
+  dimnames = list(rank_rules$variable, rank_rules$variable)
+)
+
+if (length(usable_rank_variables) > 0L) {
+  rank_matrix_usable <- baseline_rank_matrix %>%
+    dplyr::select(dplyr::all_of(usable_rank_variables)) %>%
+    as.data.frame()
+
+  not_missing_matrix <- !is.na(as.matrix(rank_matrix_usable))
+  pairwise_n_usable <- t(not_missing_matrix) %*% not_missing_matrix
+
+  if (length(usable_rank_variables) == 1L) {
+    cor_usable <- matrix(
+      1,
+      nrow = 1L,
+      ncol = 1L,
+      dimnames = list(usable_rank_variables, usable_rank_variables)
+    )
+  } else {
+    cor_usable <- suppressWarnings(stats::cor(
+      rank_matrix_usable,
+      use = "pairwise.complete.obs",
+      method = "pearson"
+    ))
+    diag(cor_usable) <- 1
+  }
+
+  baseline_rank_cor_matrix[
+    usable_rank_variables,
+    usable_rank_variables
+  ] <- cor_usable
+
+  baseline_rank_pairwise_n[
+    usable_rank_variables,
+    usable_rank_variables
+  ] <- pairwise_n_usable
+}
+
+redundancy_denominator <- rep(NA_real_, nrow(rank_rules))
+names(redundancy_denominator) <- rank_rules$variable
+
+if (length(usable_rank_variables) > 0L) {
+  redundancy_denominator[usable_rank_variables] <- rowSums(
+    baseline_rank_cor_matrix[
+      usable_rank_variables,
+      usable_rank_variables,
+      drop = FALSE
+    ]^2,
+    na.rm = TRUE
+  )
+}
+
+baseline_redundancy_weights <- rank_rules %>%
+  dplyr::select(
+    variable,
+    label,
+    data_type,
+    association_strength
+  ) %>%
+  dplyr::left_join(rank_variable_qc, by = "variable") %>%
+  dplyr::mutate(
+    n_estimable_correlations = vapply(
+      variable,
+      function(v) sum(!is.na(baseline_rank_cor_matrix[v, ])),
+      integer(1)
+    ),
+    redundancy_denominator = unname(redundancy_denominator[variable]),
+    independent_information = dplyr::case_when(
+      !usable_for_redundancy ~ 0,
+      is.na(redundancy_denominator) | redundancy_denominator <= 0 ~ NA_real_,
+      TRUE ~ 1 / redundancy_denominator
+    ),
+    independent_information_percent = 100 * independent_information,
+    composite_weight = association_strength * independent_information
+  ) %>%
+  dplyr::mutate(
+    composite_weight_normalized = if (
+      sum(composite_weight, na.rm = TRUE) > 0
+    ) {
+      composite_weight / sum(composite_weight, na.rm = TRUE)
+    } else {
+      rep(NA_real_, dplyr::n())
+    }
+  )
+
+total_composite_weight <- sum(
+  baseline_redundancy_weights$composite_weight,
+  na.rm = TRUE
+)
+total_weighted_variables <- sum(
+  !is.na(baseline_redundancy_weights$composite_weight) &
+    baseline_redundancy_weights$composite_weight > 0
+)
+
+baseline_severity_contributions <- baseline_rank_long %>%
+  dplyr::select(pat_record_id, variable, severity_rank) %>%
+  dplyr::left_join(
+    baseline_redundancy_weights %>%
+      dplyr::select(
+        variable,
+        association_strength,
+        independent_information,
+        composite_weight
+      ),
+    by = "variable"
+  ) %>%
+  dplyr::mutate(
+    weighted_contribution = severity_rank * composite_weight,
+    observed_weight = dplyr::if_else(
+      !is.na(severity_rank) & !is.na(composite_weight),
+      composite_weight,
+      0
+    )
+  )
+
+baseline_severity_by_patient <- baseline_severity_contributions %>%
+  dplyr::group_by(pat_record_id) %>%
+  dplyr::summarise(
+    baseline_severity_index = dplyr::if_else(
+      any(!is.na(weighted_contribution)),
+      sum(weighted_contribution, na.rm = TRUE),
+      NA_real_
+    ),
+    baseline_severity_n_observed = sum(
+      !is.na(severity_rank) &
+        !is.na(composite_weight) &
+        composite_weight > 0
+    ),
+    baseline_severity_n_total = total_weighted_variables,
+    baseline_severity_weight_observed = sum(observed_weight, na.rm = TRUE),
+    baseline_severity_weight_total = total_composite_weight,
+    baseline_severity_coverage = dplyr::if_else(
+      total_composite_weight > 0,
+      baseline_severity_weight_observed / total_composite_weight,
+      NA_real_
+    ),
+    .groups = "drop"
+  )
+
+# Если скрипт перезапускается в текущей R-сессии, сначала удаляем старые
+# *_rank и прежние версии итогового индекса.
+```
+
+
+# Build numeric outcome (`outcome_propensity`)
+
+This block reproduces the old numeric outcome calculation from the previous correlation-analysis code.
+
+The original ordering is preserved:
+
+**early death < late death < continues in ICU / transferred < late discharge < early discharge**.
+
+```{r}
+#| label: old-numeric-outcome
+
+required_outcome_cols <- c(
+  "pat_record_id",
+  "timepoint",
+  "outcome",
+  "ICU_in_dt",
+  "ICU_out_or_death_dt",
+  "outcome_days"
+)
+
+missing_outcome_cols <- setdiff(required_outcome_cols, names(patients_tidy))
+if (length(missing_outcome_cols) > 0L) {
+  stop(
+    "Для расчета outcome_propensity в patients_tidy нет колонок: ",
+    paste(missing_outcome_cols, collapse = ", ")
+  )
+}
+
+outcome_propensity_by_patient <- patients_tidy %>%
+  dplyr::filter(timepoint == baseline_timepoint_for_ranks) %>%
+  dplyr::arrange(pat_record_id) %>%
+  dplyr::distinct(pat_record_id, .keep_all = TRUE)
+
+max_death_day <- outcome_propensity_by_patient %>%
+  dplyr::filter(clean_chr(outcome) == "умер") %>%
+  dplyr::summarise(value = max(outcome_days, na.rm = TRUE)) %>%
+  dplyr::pull(value)
+
+max_discharge_day <- outcome_propensity_by_patient %>%
+  dplyr::filter(clean_chr(outcome) == "выписан из орит") %>%
+  dplyr::summarise(value = max(outcome_days, na.rm = TRUE)) %>%
+  dplyr::pull(value)
+
+if (!is.finite(max_death_day)) max_death_day <- 0
+if (!is.finite(max_discharge_day)) max_discharge_day <- 0
+
+outcome_score_shift <- max_death_day + max_discharge_day + 2
+outcome_continues_score <- max_death_day + 1
+
+outcome_propensity_by_patient <- outcome_propensity_by_patient %>%
+  dplyr::mutate(
+    outcome_propensity = dplyr::case_when(
+      clean_chr(outcome) == "умер" ~ outcome_days,
+      clean_chr(outcome) == "выписан из орит" ~ outcome_score_shift - outcome_days,
+      stringr::str_detect(clean_chr(outcome), "продолжает|перевед") ~ outcome_continues_score,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  dplyr::select(
+    pat_record_id,
+    outcome,
+    ICU_in_dt,
+    ICU_out_or_death_dt,
+    outcome_days,
+    outcome_propensity
+  )
+```
+
+# Save analysis outputs
+
+```{r}
+#| label: save-baseline-severity
+
+baseline_severity_results <- list(
+  rank_rules = rank_rules,
+  baseline_rank_long = baseline_rank_long,
+  baseline_rank_wide = baseline_rank_wide,
+  rank_variable_qc = rank_variable_qc,
+  correlation_matrix = baseline_rank_cor_matrix,
+  pairwise_n = baseline_rank_pairwise_n,
+  redundancy_weights = baseline_redundancy_weights,
+  patient_index = baseline_severity_by_patient
+)
+
+saveRDS(
+  baseline_severity_results,
+  file.path(ANALYSIS_DATA_DIR, "baseline_severity_results.rds")
+)
+
+saveRDS(
+  baseline_severity_by_patient,
+  file.path(ANALYSIS_DATA_DIR, "baseline_severity_by_patient.rds")
+)
+
+correlation_matrix_out <- baseline_rank_cor_matrix %>%
+  as.data.frame(check.names = FALSE) %>%
+  tibble::rownames_to_column("variable")
+
+pairwise_n_out <- baseline_rank_pairwise_n %>%
+  as.data.frame(check.names = FALSE) %>%
+  tibble::rownames_to_column("variable")
+
+openxlsx::write.xlsx(
+  list(
+    weights = baseline_redundancy_weights,
+    correlations = correlation_matrix_out,
+    pairwise_n = pairwise_n_out,
+    patient_index = baseline_severity_by_patient
+  ),
+  file.path(TABLES_DIR, "2Reg_baseline_redundancy_weights.xlsx"),
+  asTable = TRUE,
+  overwrite = TRUE
+)
+
+saveRDS(
+  outcome_propensity_by_patient,
+  file.path(ANALYSIS_DATA_DIR, "outcome_propensity_by_patient.rds")
+)
+
+openxlsx::write.xlsx(
+  outcome_propensity_by_patient,
+  file.path(TABLES_DIR, "2Reg_outcome_propensity.xlsx"),
+  asTable = TRUE,
+  overwrite = TRUE
+)
+
+cat("Baseline severity analysis saved.
+")
+cat("Rank variables:", ncol(baseline_rank_wide) - 1L, "
+")
+cat("Variables with non-zero composite weight:", total_weighted_variables, "
+")
+cat(
+  "Median baseline severity coverage:",
+  round(stats::median(baseline_severity_by_patient$baseline_severity_coverage, na.rm = TRUE), 3),
+  "
+"
+)
+cat("Outcome propensity saved.\n")
+cat("Maximum death day used in old score:", round(max_death_day, 2), "\n")
+cat("Maximum discharge day used in old score:", round(max_discharge_day, 2), "\n")
+cat("Continues/transferred score:", round(outcome_continues_score, 2), "\n")
+```

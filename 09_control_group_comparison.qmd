@@ -1,0 +1,999 @@
+---
+title: "2Reg — сравнение со взрослой контрольной группой"
+lang: ru
+format:
+  html:
+    toc: true
+    toc-title: "Содержание"
+    number-sections: true
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: false
+---
+
+# Исходные данные и правила
+
+- Входные файлы: `data/patients_tidy.rds` и `data/control_tidy.rds`.
+- Группы: контроль, первая LPS и первая CT; LPS NEO исключена.
+- Используются четыре исходные точки и LOCF. Относительное изменение рассчитывается при исходном значении > 0.
+
+# Настройка
+
+```{r}
+#| label: setup
+#| include: false
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(stringr)
+  library(tibble)
+  library(lubridate)
+  library(ggplot2)
+  library(gtsummary)
+  library(flextable)
+  library(broom)
+  library(nlme)
+  library(zoo)
+  library(survival)
+  library(tidycmprsk)
+  library(ggsurvfit)
+})
+
+source("R/analysis_helpers.R")
+
+DATA_DIR <- "data"
+ANALYSIS_DATA_DIR <- file.path(DATA_DIR, "analysis")
+TABLES_DIR <- "tables"
+GRAPHES_DIR <- "graphes"
+
+dir.create(ANALYSIS_DATA_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(TABLES_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(GRAPHES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+patients_rds <- pick_path(c(
+  file.path(DATA_DIR, "patients_tidy.rds"),
+  file.path("/mnt/data", DATA_DIR, "patients_tidy.rds"),
+  "patients_tidy.rds"
+))
+
+control_rds <- pick_path(c(
+  file.path(DATA_DIR, "control_tidy.rds"),
+  file.path("/mnt/data", DATA_DIR, "control_tidy.rds"),
+  "control_tidy.rds"
+))
+
+patients_tidy <- readRDS(patients_rds)
+control_tidy <- readRDS(control_rds)
+
+tp_levels <- c("m12h_0h", "48h_72h", "4d_6d", "7d_10d")
+tp_labels <- c(
+  m12h_0h = "−12–0 ч",
+  `48h_72h` = "48–72 ч",
+  `4d_6d` = "4–6 суток",
+  `7d_10d` = "7–10 суток"
+)
+group_levels <- c("Контроль", "LPS", "CT")
+metric_labels <- c(
+  SOFA = "SOFA",
+  VIS2020 = "VIS2020",
+  NLR = "NLR",
+  lymphocytes = "Лимфоциты",
+  thrombocytes = "Тромбоциты",
+  C_react_protein = "C-реактивный белок",
+  PaFiO2_calc = "P/F",
+  lactate = "Лактат"
+)
+metrics <- names(metric_labels)
+
+first_not_na <- function(x) {
+  idx <- which(!is.na(x))
+  if (length(idx)) x[idx[1]] else x[NA_integer_]
+}
+
+assert_columns(
+  patients_tidy,
+  c(
+    "pat_record_id", "timepoint", "first_sorption_type", "first_sorption_dt",
+    "clin_assess_dt", "ICU_in_dt", "ICU_out_or_death_dt",
+    "antibiotics_start_dt", "outcome", metrics
+  ),
+  "patients_tidy"
+)
+
+assert_columns(
+  control_tidy,
+  c(
+    "pat_record_id", "timepoint", "clin_assess_dt", "index_dt",
+    "ICU_in_dt", "ICU_out_or_death_dt", "antibiotics_start_dt",
+    "outcome", metrics
+  ),
+  "control_tidy"
+)
+```
+
+# Формирование трёх групп сравнения
+
+```{r}
+#| label: build-comparison-data
+#| include: false
+
+treated_comparison <- patients_tidy %>%
+  filter(first_sorption_type %in% c("LPS", "CT")) %>%
+  mutate(
+    registry_source = "registry2_sorption",
+    comparison_group = as.character(first_sorption_type)
+  )
+
+control_comparison <- control_tidy %>%
+  mutate(
+    registry_source = "registry3_control",
+    comparison_group = "Контроль"
+  )
+
+common_cols <- union(names(treated_comparison), names(control_comparison))
+
+add_missing_cols <- function(df, cols) {
+  missing_cols <- setdiff(cols, names(df))
+  if (length(missing_cols)) df[missing_cols] <- NA
+  df %>% select(all_of(cols))
+}
+
+comparison_tidy <- bind_rows(
+  add_missing_cols(treated_comparison, common_cols),
+  add_missing_cols(control_comparison, common_cols)
+) %>%
+  mutate(
+    comparison_group = factor(comparison_group, levels = group_levels),
+    timepoint = factor(as.character(timepoint), levels = tp_levels, ordered = TRUE)
+  )
+
+comparison_group_qc <- comparison_tidy %>%
+  distinct(pat_record_id, comparison_group, age_yr) %>%
+  group_by(comparison_group) %>%
+  summarise(
+    n_patients = n(),
+    n_age_under_18 = sum(age_yr < 18, na.rm = TRUE),
+    n_age_missing = sum(is.na(age_yr)),
+    .groups = "drop"
+  )
+```
+
+```{r}
+#| label: comparison-group-qc
+
+comparison_group_qc %>%
+  transmute(
+    `Группа` = comparison_group,
+    `Пациенты, n` = n_patients,
+    `<18 лет, n` = n_age_under_18,
+    `Возраст неизвестен, n` = n_age_missing
+  )
+```
+
+# Индексная дата и проверка времени
+
+Индекс используется для анализа исходов. Для контроля это исходная точка, для
+LPS и CT — последняя клиническая оценка до первой сорбции.
+
+```{r}
+#| label: build-index-dates
+#| include: false
+
+control_index <- comparison_tidy %>%
+  filter(comparison_group == "Контроль", timepoint == "m12h_0h") %>%
+  transmute(
+    pat_record_id,
+    index_dt = clin_assess_dt,
+    index_timepoint = as.character(timepoint),
+    index_source = "control_documented_m12h_0h"
+  )
+
+treated_index <- comparison_tidy %>%
+  filter(
+    comparison_group %in% c("LPS", "CT"),
+    !is.na(clin_assess_dt),
+    !is.na(first_sorption_dt),
+    clin_assess_dt <= first_sorption_dt
+  ) %>%
+  group_by(pat_record_id) %>%
+  slice_max(clin_assess_dt, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  transmute(
+    pat_record_id,
+    index_dt = clin_assess_dt,
+    index_timepoint = as.character(timepoint),
+    index_source = "last_clinical_assessment_before_first_sorption"
+  )
+
+index_by_patient <- bind_rows(control_index, treated_index)
+
+patient_static <- comparison_tidy %>%
+  arrange(pat_record_id, timepoint) %>%
+  group_by(pat_record_id, comparison_group) %>%
+  summarise(
+    ICU_in_dt = first_not_na(ICU_in_dt),
+    ICU_out_or_death_dt = first_not_na(ICU_out_or_death_dt),
+    antibiotics_start_dt = first_not_na(antibiotics_start_dt),
+    first_sorption_dt = first_not_na(first_sorption_dt),
+    record_date_updated_dt = first_not_na(record_date_updated_dt),
+    record_date_created_dt = first_not_na(record_date_created_dt),
+    outcome = first_not_na(outcome),
+    age_yr = first_not_na(age_yr),
+    .groups = "drop"
+  ) %>%
+  left_join(index_by_patient, by = "pat_record_id") %>%
+  mutate(
+    ICU_to_index_hours = as.numeric(
+      difftime(index_dt, ICU_in_dt, units = "hours")
+    ),
+    antibiotics_to_index_hours = as.numeric(
+      difftime(index_dt, antibiotics_start_dt, units = "hours")
+    ),
+    index_to_ICU_event_days = as.numeric(
+      difftime(ICU_out_or_death_dt, index_dt, units = "days")
+    ),
+    index_to_sorption_hours = as.numeric(
+      difftime(first_sorption_dt, index_dt, units = "hours")
+    ),
+    index_is_documented_baseline = index_timepoint == "m12h_0h"
+  )
+
+index_qc <- patient_static %>%
+  group_by(comparison_group) %>%
+  summarise(
+    n_patients = n(),
+    n_with_index = sum(!is.na(index_dt)),
+    n_without_index = sum(is.na(index_dt)),
+    n_index_is_documented_baseline = sum(index_is_documented_baseline, na.rm = TRUE),
+    n_negative_index_to_event = sum(index_to_ICU_event_days < 0, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+#| label: index-qc
+
+index_qc %>%
+  transmute(
+    `Группа` = comparison_group,
+    `Пациенты, n` = n_patients,
+    `Есть индекс, n` = n_with_index,
+    `Нет индекса, n` = n_without_index,
+    `Индекс — исходная точка, n` = n_index_is_documented_baseline,
+    `Исход раньше индекса, n` = n_negative_index_to_event
+  )
+```
+
+```{r}
+#| label: timing-audit-table
+
+timing_audit_table <- patient_static %>%
+  select(
+    comparison_group,
+    ICU_to_index_hours,
+    antibiotics_to_index_hours,
+    index_to_ICU_event_days,
+    index_to_sorption_hours
+  ) %>%
+  tbl_summary(
+    by = comparison_group,
+    statistic = all_continuous() ~ "{median} ({p25}; {p75})",
+    digits = all_continuous() ~ 1,
+    label = list(
+      ICU_to_index_hours ~ "Поступление в ОРИТ → индекс, ч",
+      antibiotics_to_index_hours ~ "Начало АБ → индекс, ч",
+      index_to_ICU_event_days ~ "Индекс → исход в ОРИТ, суток",
+      index_to_sorption_hours ~ "Индекс → первая сорбция, ч"
+    ),
+    missing = "ifany"
+  ) %>%
+  add_overall(last = TRUE) %>%
+  add_p(test = all_continuous() ~ "kruskal.test") %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(label = if_else(row_type == "missing", "Неизвестно", label))
+  ) %>%
+  modify_header(
+    label ~ "**Показатель**",
+    stat_0 ~ "**Все**, N = {N}",
+    p.value ~ "**p**"
+  ) %>%
+  modify_footnote_header(
+    columns = all_stat_cols(),
+    footnote = "Медиана (Q1; Q3)"
+  ) %>%
+  modify_footnote_header(
+    columns = p.value,
+    footnote = "Критерий Краскела—Уоллиса"
+  ) %>%
+  bold_labels()
+
+timing_audit_table
+```
+
+# Таблица 0: исходные показатели
+
+```{r}
+#| label: table-zero
+
+baseline_comparison <- comparison_tidy %>%
+  filter(timepoint == "m12h_0h") %>%
+  distinct(pat_record_id, .keep_all = TRUE) %>%
+  mutate(
+    sex = factor(sex),
+    vasopressors_if_used = factor(vasopressors_if_used),
+    MV_if_used = factor(MV_if_used),
+    RRT_if_used = factor(RRT_if_used),
+    from_other_ICU_transfer = factor(from_other_ICU_transfer),
+    ICU_6_month_history = factor(ICU_6_month_history)
+  )
+
+baseline_vars <- intersect(
+  c(
+    "age_yr", "sex", "BMI", "charlson_index",
+    "ICU_6_month_history", "from_other_ICU_transfer",
+    "vasopressors_if_used", "MV_if_used", "RRT_if_used",
+    metrics
+  ),
+  names(baseline_comparison)
+)
+
+table_zero <- baseline_comparison %>%
+  select(comparison_group, all_of(baseline_vars)) %>%
+  tbl_summary(
+    by = comparison_group,
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}; {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 2,
+    label = list(
+      age_yr ~ "Возраст, лет",
+      sex ~ "Пол",
+      BMI ~ "ИМТ",
+      charlson_index ~ "Индекс Чарлсона",
+      ICU_6_month_history ~ "ОРИТ в последние 6 месяцев",
+      from_other_ICU_transfer ~ "Перевод из другого ОРИТ",
+      vasopressors_if_used ~ "Вазопрессоры",
+      MV_if_used ~ "ИВЛ",
+      RRT_if_used ~ "ЗПТ",
+      SOFA ~ "SOFA",
+      VIS2020 ~ "VIS2020",
+      NLR ~ "NLR",
+      lymphocytes ~ "Лимфоциты",
+      thrombocytes ~ "Тромбоциты",
+      C_react_protein ~ "C-реактивный белок",
+      PaFiO2_calc ~ "P/F",
+      lactate ~ "Лактат"
+    ),
+    missing = "ifany"
+  ) %>%
+  add_overall(last = TRUE) %>%
+  add_p(
+    test = list(
+      all_continuous() ~ "kruskal.test",
+      all_categorical() ~ "fisher.test"
+    )
+  ) %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(label = if_else(row_type == "missing", "Неизвестно", label))
+  ) %>%
+  modify_header(
+    label ~ "**Показатель**",
+    stat_0 ~ "**Все**, N = {N}",
+    p.value ~ "**p**"
+  ) %>%
+  modify_footnote_header(
+    columns = all_stat_cols(),
+    footnote = "Медиана (Q1; Q3); n (%)"
+  ) %>%
+  modify_footnote_header(
+    columns = p.value,
+    footnote = "Критерий Краскела—Уоллиса; точный критерий Фишера"
+  ) %>%
+  bold_labels()
+
+table_zero
+```
+
+# Динамика: информированные нули и LOCF
+
+LOCF применяется только в этом модуле. Исходные RDS не изменяются; способ
+заполнения сохраняется для каждого значения.
+
+```{r}
+#| label: prepare-dynamics
+#| include: false
+
+dynamic_static_cols <- intersect(
+  c(
+    "comparison_group", "registry_source", "first_sorption_dt",
+    "ICU_in_dt", "ICU_out_or_death_dt", "antibiotics_start_dt",
+    "record_date_updated_dt", "record_date_created_dt", "outcome",
+    "vasopressors_if_used_bin"
+  ),
+  names(comparison_tidy)
+)
+
+dynamic_wide <- comparison_tidy %>%
+  select(
+    pat_record_id,
+    timepoint,
+    all_of(dynamic_static_cols),
+    all_of(metrics)
+  ) %>%
+  distinct(pat_record_id, timepoint, .keep_all = TRUE) %>%
+  complete(
+    pat_record_id,
+    timepoint = factor(tp_levels, levels = tp_levels, ordered = TRUE)
+  ) %>%
+  group_by(pat_record_id) %>%
+  fill(all_of(dynamic_static_cols), .direction = "downup") %>%
+  ungroup() %>%
+  left_join(
+    patient_static %>% select(pat_record_id, index_dt),
+    by = "pat_record_id"
+  ) %>%
+  mutate(
+    dynamic_anchor_dt = if_else(
+      comparison_group == "Контроль",
+      index_dt,
+      first_sorption_dt
+    ),
+    .outcome_norm = str_to_lower(str_squish(coalesce(outcome, ""))),
+    .outcome_key = case_when(
+      str_detect(.outcome_norm, "умер|death|dead") ~ "dead",
+      str_detect(.outcome_norm, "выпис|discharg") ~ "out",
+      str_detect(.outcome_norm, "перевед|transfer") ~ "transferred",
+      TRUE ~ "in"
+    )
+  ) %>%
+  left_join(
+    tibble(
+      timepoint = factor(tp_levels, levels = tp_levels, ordered = TRUE),
+      end_h = c(0, 72, 144, 240)
+    ),
+    by = "timepoint"
+  ) %>%
+  mutate(
+    .hours_to_event = as.numeric(
+      difftime(ICU_out_or_death_dt, dynamic_anchor_dt, units = "hours")
+    ),
+    analysis_status = case_when(
+      is.na(dynamic_anchor_dt) ~ "n/a",
+      is.na(ICU_out_or_death_dt) ~ "in",
+      .hours_to_event <= end_h & .outcome_key == "out" ~ "out",
+      .hours_to_event <= end_h & .outcome_key == "dead" ~ "dead",
+      .hours_to_event <= end_h & .outcome_key == "transferred" ~ "transferred",
+      .hours_to_event > end_h ~ "in",
+      TRUE ~ "n/a"
+    ),
+    SOFA_before_zero_rule = SOFA,
+    VIS2020_before_zero_rule = VIS2020,
+    SOFA_source_before_locf = case_when(
+      !is.na(SOFA_before_zero_rule) ~ "observed",
+      analysis_status == "out" ~ "zero_after_ICU_discharge",
+      TRUE ~ "missing"
+    ),
+    VIS2020_source_before_locf = case_when(
+      !is.na(VIS2020_before_zero_rule) ~ "observed",
+      analysis_status == "out" ~ "zero_after_ICU_discharge",
+      vasopressors_if_used_bin == 0L ~ "zero_no_vasopressors",
+      TRUE ~ "missing"
+    ),
+    # Наблюдаемые значения не заменяются, в том числе в день выписки.
+    SOFA = if_else(
+      is.na(SOFA_before_zero_rule) & analysis_status == "out",
+      0,
+      SOFA_before_zero_rule
+    ),
+    VIS2020 = if_else(
+      is.na(VIS2020_before_zero_rule) &
+        (analysis_status == "out" | vasopressors_if_used_bin == 0L),
+      0,
+      VIS2020_before_zero_rule
+    )
+  )
+
+dynamic_long <- dynamic_wide %>%
+  select(
+    pat_record_id,
+    comparison_group,
+    timepoint,
+    analysis_status,
+    vasopressors_if_used_bin,
+    SOFA_source_before_locf,
+    VIS2020_source_before_locf,
+    all_of(metrics)
+  ) %>%
+  pivot_longer(
+    cols = all_of(metrics),
+    names_to = "variable",
+    values_to = "value_before_locf"
+  ) %>%
+  mutate(
+    value_source_before_locf = case_when(
+      variable == "SOFA" ~ SOFA_source_before_locf,
+      variable == "VIS2020" ~ VIS2020_source_before_locf,
+      !is.na(value_before_locf) ~ "observed",
+      TRUE ~ "missing"
+    )
+  ) %>%
+  arrange(pat_record_id, variable, timepoint) %>%
+  group_by(pat_record_id, variable) %>%
+  mutate(
+    value = zoo::na.locf(value_before_locf, na.rm = FALSE),
+    value_source = case_when(
+      !is.na(value_before_locf) ~ value_source_before_locf,
+      is.na(value_before_locf) & !is.na(value) ~ "LOCF",
+      TRUE ~ "missing_no_previous_value"
+    ),
+    baseline_value = value[match("m12h_0h", as.character(timepoint))],
+    absolute_change = value - baseline_value,
+    # Процентное изменение не рассчитывается при исходном значении 0.
+    relative_change_pct = if_else(
+      !is.na(baseline_value) & baseline_value > 0,
+      100 * (value - baseline_value) / baseline_value,
+      NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    variable_label = factor(
+      metric_labels[variable],
+      levels = unname(metric_labels)
+    ),
+    timepoint_label = factor(
+      tp_labels[as.character(timepoint)],
+      levels = unname(tp_labels)
+    )
+  )
+
+saveRDS(
+  dynamic_long,
+  file.path(ANALYSIS_DATA_DIR, "control_comparison_dynamics_long.rds")
+)
+```
+
+```{r}
+#| label: locf-qc
+
+locf_qc <- dynamic_long %>%
+  count(variable_label, timepoint_label, value_source, name = "n_rows") %>%
+  arrange(variable_label, timepoint_label, value_source)
+
+locf_qc %>%
+  mutate(
+    value_source = recode(
+      value_source,
+      observed = "Наблюдаемое значение",
+      LOCF = "LOCF",
+      zero_after_ICU_discharge = "0 после выписки из ОРИТ",
+      zero_no_vasopressors = "0 при отсутствии вазопрессоров",
+      missing_no_previous_value = "Нет предыдущего значения"
+    )
+  ) %>%
+  transmute(
+    `Показатель` = variable_label,
+    `Точка` = timepoint_label,
+    `Источник значения` = value_source,
+    `Строки, n` = n_rows
+  )
+```
+
+# Относительное изменение от исходной точки
+
+```{r}
+#| label: relative-change-summary
+
+relative_change_summary <- dynamic_long %>%
+  filter(timepoint != "m12h_0h", !is.na(relative_change_pct)) %>%
+  group_by(variable_label, comparison_group, timepoint_label) %>%
+  summarise(
+    n = n(),
+    median_pct = median(relative_change_pct),
+    q1_pct = quantile(relative_change_pct, 0.25),
+    q3_pct = quantile(relative_change_pct, 0.75),
+    .groups = "drop"
+  )
+
+relative_change_summary %>%
+  transmute(
+    `Показатель` = variable_label,
+    `Группа` = comparison_group,
+    `Точка` = timepoint_label,
+    `n` = n,
+    `Медиана, %` = median_pct,
+    `Q1, %` = q1_pct,
+    `Q3, %` = q3_pct
+  )
+```
+
+```{r}
+#| label: relative-change-plot
+#| fig-width: 12
+#| fig-height: 15
+
+relative_change_plot <- relative_change_summary %>%
+  ggplot(
+    aes(
+      x = timepoint_label,
+      y = median_pct,
+      group = comparison_group,
+      colour = comparison_group
+    )
+  ) +
+  geom_hline(yintercept = 0, colour = "grey75") +
+  geom_ribbon(
+    aes(ymin = q1_pct, ymax = q3_pct, fill = comparison_group),
+    alpha = 0.12,
+    colour = NA
+  ) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  facet_wrap(~ variable_label, scales = "free_y", ncol = 2) +
+  labs(
+    x = NULL,
+    y = "Изменение относительно исходного значения, %",
+    colour = "Группа",
+    fill = "Группа"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+relative_change_plot
+```
+
+# Абсолютное изменение VIS у всех пациентов
+
+```{r}
+#| label: vis-absolute-change
+
+vis_absolute_summary <- dynamic_long %>%
+  filter(variable == "VIS2020") %>%
+  group_by(comparison_group, timepoint_label) %>%
+  summarise(
+    n = sum(!is.na(absolute_change)),
+    median_change = median(absolute_change, na.rm = TRUE),
+    q1_change = quantile(absolute_change, 0.25, na.rm = TRUE),
+    q3_change = quantile(absolute_change, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+vis_absolute_summary %>%
+  transmute(
+    `Группа` = comparison_group,
+    `Точка` = timepoint_label,
+    `n` = n,
+    `Медиана` = median_change,
+    `Q1` = q1_change,
+    `Q3` = q3_change
+  )
+```
+
+# Сравнение групп в отдельных точках
+
+Сравнивается процентное изменение в каждой точке. Для VIS сюда входят только
+пациенты с исходным VIS > 0.
+
+```{r}
+#| label: pointwise-relative-tests
+
+safe_kruskal <- function(df) {
+  df <- df %>% filter(!is.na(relative_change_pct), !is.na(comparison_group))
+  if (nrow(df) < 3 || n_distinct(df$comparison_group) < 2) {
+    return(tibble(n = nrow(df), statistic = NA_real_, p_value = NA_real_))
+  }
+  fit <- kruskal.test(relative_change_pct ~ comparison_group, data = df)
+  tibble(
+    n = nrow(df),
+    statistic = unname(fit$statistic),
+    p_value = fit$p.value
+  )
+}
+
+pointwise_relative_tests <- dynamic_long %>%
+  filter(timepoint != "m12h_0h") %>%
+  group_by(variable, variable_label, timepoint, timepoint_label) %>%
+  group_modify(~ safe_kruskal(.x)) %>%
+  ungroup() %>%
+  mutate(p_value_BH = p.adjust(p_value, method = "BH"))
+
+pointwise_relative_tests %>%
+  transmute(
+    `Показатель` = variable_label,
+    `Точка` = timepoint_label,
+    `n` = n,
+    `Статистика` = statistic,
+    `p` = p_value,
+    `p, поправка BH` = p_value_BH
+  )
+```
+
+# Модели «группа × время»
+
+Модели оценивают различия динамики относительных изменений между группами.
+Случайный интерсепт учитывает повторные измерения пациента.
+
+```{r}
+#| label: interaction-models
+
+fit_change_model <- function(df) {
+  model_data <- df %>%
+    filter(
+      timepoint != "m12h_0h",
+      !is.na(relative_change_pct),
+      !is.na(comparison_group)
+    ) %>%
+    mutate(
+      comparison_group = droplevels(comparison_group),
+      timepoint = droplevels(factor(timepoint))
+    )
+
+  if (
+    nrow(model_data) < 10 ||
+      n_distinct(model_data$comparison_group) < 2 ||
+      n_distinct(model_data$timepoint) < 2
+  ) {
+    return(tibble(
+      n_rows = nrow(model_data),
+      n_patients = n_distinct(model_data$pat_record_id),
+      interaction_p = NA_real_,
+      model_status = "insufficient_data"
+    ))
+  }
+
+  fit <- tryCatch(
+    nlme::lme(
+      fixed = relative_change_pct ~ comparison_group * timepoint,
+      random = ~ 1 | pat_record_id,
+      data = model_data,
+      na.action = na.omit,
+      control = nlme::lmeControl(returnObject = TRUE)
+    ),
+    error = function(e) e
+  )
+
+  if (inherits(fit, "error")) {
+    return(tibble(
+      n_rows = nrow(model_data),
+      n_patients = n_distinct(model_data$pat_record_id),
+      interaction_p = NA_real_,
+      model_status = conditionMessage(fit)
+    ))
+  }
+
+  aov_tbl <- as.data.frame(anova(fit))
+  interaction_row <- str_detect(rownames(aov_tbl), "comparison_group:timepoint")
+
+  tibble(
+    n_rows = nrow(model_data),
+    n_patients = n_distinct(model_data$pat_record_id),
+    interaction_p = if (any(interaction_row)) {
+      aov_tbl$`p-value`[which(interaction_row)[1]]
+    } else {
+      NA_real_
+    },
+    model_status = "ok"
+  )
+}
+
+interaction_models <- dynamic_long %>%
+  group_by(variable, variable_label) %>%
+  group_modify(~ fit_change_model(.x)) %>%
+  ungroup() %>%
+  mutate(interaction_p_BH = p.adjust(interaction_p, method = "BH"))
+
+interaction_models %>%
+  mutate(
+    model_status = recode(
+      model_status,
+      ok = "Успешно",
+      insufficient_data = "Недостаточно данных"
+    )
+  ) %>%
+  transmute(
+    `Показатель` = variable_label,
+    `Строки, n` = n_rows,
+    `Пациенты, n` = n_patients,
+    `p взаимодействия` = interaction_p,
+    `p, поправка BH` = interaction_p_BH,
+    `Статус модели` = model_status
+  )
+```
+
+# Бинарный исход в ОРИТ
+
+Сравниваются смерть и выписка из ОРИТ. Переводы и продолжающееся пребывание в
+ОРИТ не относятся ни к одному бинарному исходу.
+
+```{r}
+#| label: binary-outcome
+
+outcome_analysis <- patient_static %>%
+  mutate(
+    .outcome_norm = str_to_lower(str_squish(coalesce(outcome, ""))),
+    outcome_binary = case_when(
+      str_detect(.outcome_norm, "умер|death|dead") ~ "Смерть",
+      str_detect(.outcome_norm, "выпис|discharg") ~ "Выписка из ОРИТ",
+      TRUE ~ NA_character_
+    ),
+    outcome_binary = factor(
+      outcome_binary, levels = c("Выписка из ОРИТ", "Смерть")
+    ),
+    ICU_length_days = as.numeric(
+      difftime(ICU_out_or_death_dt, ICU_in_dt, units = "days")
+    )
+  )
+
+binary_outcome_table <- outcome_analysis %>%
+  filter(!is.na(outcome_binary)) %>%
+  select(comparison_group, outcome_binary) %>%
+  tbl_summary(
+    by = comparison_group,
+    statistic = all_categorical() ~ "{n} ({p}%)",
+    label = outcome_binary ~ "Исход в ОРИТ",
+    missing = "no"
+  ) %>%
+  add_p(test = outcome_binary ~ "fisher.test") %>%
+  modify_header(
+    label ~ "**Исход**",
+    p.value ~ "**p**"
+  ) %>%
+  modify_footnote_header(
+    columns = all_stat_cols(),
+    footnote = "n (%)"
+  ) %>%
+  modify_footnote_header(
+    columns = p.value,
+    footnote = "Точный критерий Фишера"
+  ) %>%
+  bold_labels()
+
+binary_outcome_table
+```
+
+# Кумулятивная инцидентность выписки и смерти
+
+```{r}
+#| label: competing-risk-data
+#| include: false
+
+competing_data <- outcome_analysis %>%
+  mutate(
+    .outcome_norm = str_to_lower(str_squish(coalesce(outcome, ""))),
+    event_status = case_when(
+      str_detect(.outcome_norm, "выпис|discharg") ~ "Выписка из ОРИТ",
+      str_detect(.outcome_norm, "умер|death|dead") ~ "Смерть",
+      TRUE ~ "Цензура"
+    ),
+    censor_dt = coalesce(
+      ICU_out_or_death_dt,
+      record_date_updated_dt,
+      record_date_created_dt
+    ),
+    analysis_end_dt = case_when(
+      event_status %in% c("Выписка из ОРИТ", "Смерть") ~ ICU_out_or_death_dt,
+      TRUE ~ censor_dt
+    ),
+    event_time_days = as.numeric(
+      difftime(analysis_end_dt, index_dt, units = "days")
+    ),
+    event_status = factor(
+      event_status,
+      levels = c("Цензура", "Выписка из ОРИТ", "Смерть")
+    )
+  ) %>%
+  filter(
+    !is.na(index_dt),
+    !is.na(event_time_days),
+    event_time_days >= 0,
+    !is.na(comparison_group)
+  )
+
+competing_risk_qc <- competing_data %>%
+  count(comparison_group, event_status, name = "n_patients", .drop = FALSE)
+
+cuminc_fit <- tidycmprsk::cuminc(
+  Surv(event_time_days, event_status) ~ comparison_group,
+  data = competing_data
+)
+```
+
+```{r}
+#| label: competing-risk-qc
+
+competing_risk_qc %>%
+  transmute(
+    `Группа` = comparison_group,
+    `Статус` = event_status,
+    `Пациенты, n` = n_patients
+  )
+```
+
+```{r}
+#| label: cumulative-incidence-plot
+#| fig-width: 11
+#| fig-height: 8
+
+cuminc_plot <- ggsurvfit::ggcuminc(
+  cuminc_fit, outcome = c("Выписка из ОРИТ", "Смерть")
+) +
+  ggsurvfit::add_confidence_interval() +
+  ggsurvfit::add_risktable() +
+  labs(
+    x = "Сутки от индексной точки",
+    y = "Кумулятивная инцидентность",
+    colour = "Группа"
+  ) +
+  theme_minimal(base_size = 11)
+
+cuminc_plot
+```
+
+```{r}
+#| label: gray-tests
+
+gray_tests <- broom::glance(cuminc_fit)
+tibble(
+  `Исход` = c(gray_tests$outcome_1, gray_tests$outcome_2),
+  `Статистика` = c(gray_tests$statistic_1, gray_tests$statistic_2),
+  `Степени свободы` = c(gray_tests$df_1, gray_tests$df_2),
+  `p` = c(gray_tests$p.value_1, gray_tests$p.value_2)
+)
+```
+
+# Длительность пребывания в ОРИТ
+
+Показатель приведён описательно и отдельно для выписки и смерти.
+
+```{r}
+#| label: ICU-length-summary
+
+ICU_length_summary <- outcome_analysis %>%
+  filter(!is.na(outcome_binary), ICU_length_days >= 0) %>%
+  group_by(comparison_group, outcome_binary) %>%
+  summarise(
+    n = n(),
+    median_days = median(ICU_length_days),
+    q1_days = quantile(ICU_length_days, 0.25),
+    q3_days = quantile(ICU_length_days, 0.75),
+    .groups = "drop"
+  )
+
+ICU_length_summary %>%
+  transmute(
+    `Группа` = comparison_group,
+    `Исход` = outcome_binary,
+    `n` = n,
+    `Медиана, суток` = median_days,
+    `Q1, суток` = q1_days,
+    `Q3, суток` = q3_days
+  )
+```
+
+# Сохранение результатов
+
+```{r}
+#| label: save-analysis-objects
+#| include: false
+
+saveRDS(
+  patient_static,
+  file.path(ANALYSIS_DATA_DIR, "control_comparison_index_by_patient.rds")
+)
+saveRDS(
+  competing_data,
+  file.path(ANALYSIS_DATA_DIR, "control_comparison_competing_risks.rds")
+)
+saveRDS(
+  interaction_models,
+  file.path(ANALYSIS_DATA_DIR, "control_comparison_interaction_models.rds")
+)
+```

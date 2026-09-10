@@ -1,0 +1,721 @@
+---
+title: "2Reg — 08a presentation baseline and sorptions"
+format:
+  html:
+    toc: true
+    number-sections: true
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: false
+---
+
+# Входные данные и предварительные условия
+
+Этот файл не зависит от других аналитических QMD-файлов и использует только итоговые RDS-файлы ETL и словарь для отображения подписей.
+
+Необходимые входные данные ETL считываются только из RDS-файлов:
+
+data/patients_tidy.rds
+data/HA_tidy.rds
+
+Словарь меток data/2Reg_Dictionary_tidy.xlsx используется только для отображения подписей в таблице сорбций.
+
+Выходные файлы — таблицы PowerPoint, сохраняемые в папке tables/.
+
+# Setup
+
+```{r}
+#| label: setup
+#| include: false
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(stringr)
+  library(tibble)
+  library(gtsummary)
+  library(flextable)
+  library(rlang)
+  library(lubridate)
+})
+
+source("R/analysis_helpers.R")
+
+DATA_DIR <- "data"
+TABLES_DIR <- "tables"
+dir.create(TABLES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+patients_rds <- pick_path(c(
+  file.path(DATA_DIR, "patients_tidy.rds"),
+  file.path("/mnt/data", DATA_DIR, "patients_tidy.rds"),
+  "patients_tidy.rds"
+))
+
+ha_rds <- pick_path(c(
+  file.path(DATA_DIR, "HA_tidy.rds"),
+  file.path("/mnt/data", DATA_DIR, "HA_tidy.rds"),
+  "HA_tidy.rds"
+))
+
+dict_file <- pick_path(c(
+  file.path(DATA_DIR, "2Reg_Dictionary_tidy.xlsx"),
+  file.path("/mnt/data", DATA_DIR, "2Reg_Dictionary_tidy.xlsx"),
+  "2Reg_Dictionary_tidy.xlsx"
+))
+
+patients_tidy <- readRDS(patients_rds)
+HA_tidy <- readRDS(ha_rds)
+
+dict <- read_dictionary_labels(dict_file)
+dict_ha <- dict %>%
+  filter(dataset == "ha", !is.na(short), short != "") %>%
+  group_by(short) %>%
+  summarise(ru = first(na.omit(ru)), .groups = "drop")
+
+`%||%` <- function(x, y) {
+  if (!is.null(x) && length(x) && !is.na(x) && as.character(x) != "") x else y
+}
+
+norm0 <- function(x) {
+  x %>%
+    as.character() %>%
+    str_replace_all("\\u00A0", " ") %>%
+    str_squish() %>%
+    str_to_lower()
+}
+
+# Компоновка сводных таблиц под стандартный слайд PowerPoint.
+# Ширина распределяется между названием показателя и группами явно,
+# поэтому длинные заголовки не выходят за правую границу слайда.
+style_summary_pptx <- function(ft, max_width = 8.9) {
+  ft <- flextable::autofit(ft)
+  keys <- ft$col_keys
+  stat_keys <- grep("^stat_", keys, value = TRUE)
+
+  if ("label" %in% keys && length(stat_keys) > 0L) {
+    label_width <- if (length(stat_keys) >= 3L) 3.4 else 4.1
+    stat_width <- (max_width - label_width) / length(stat_keys)
+
+    ft <- ft %>%
+      flextable::width(j = "label", width = label_width) %>%
+      flextable::width(j = stat_keys, width = stat_width) %>%
+      flextable::align(j = stat_keys, align = "center", part = "all") %>%
+      flextable::padding(j = stat_keys, padding.left = 6, padding.right = 6, part = "all")
+  }
+
+  flextable::fit_to_width(ft, max_width = max_width)
+}
+```
+
+# Slide 1. General registry summary
+
+```{r}
+#| label: pptx-slide1
+
+cartridge_col <- case_when(
+  "HA_cartrige_type" %in% names(HA_tidy) ~ "HA_cartrige_type",
+  "HA_cartrige_type_std" %in% names(HA_tidy) ~ "HA_cartrige_type_std",
+  TRUE ~ NA_character_
+)
+
+if (is.na(cartridge_col)) {
+  stop("Не найден столбец HA_cartrige_type / HA_cartrige_type_std в HA_tidy")
+}
+
+n_pat <- patients_tidy %>%
+  summarise(n = n_distinct(pat_record_id)) %>%
+  pull(n)
+
+n_centers <- patients_tidy %>%
+  summarise(n = n_distinct(organization)) %>%
+  pull(n)
+
+cartridge_counts <- HA_tidy %>%
+  transmute(cartridge = .data[[cartridge_col]]) %>%
+  summarise(
+    n_ct = sum(cartridge == "CT", na.rm = TRUE),
+    n_lps = sum(cartridge == "LPS", na.rm = TRUE),
+    n_lps_neo = sum(cartridge == "LPS NEO", na.rm = TRUE)
+  )
+
+mean_sorp <- HA_tidy %>%
+  filter(!is.na(pat_record_id), pat_record_id != "") %>%
+  count(pat_record_id, name = "n_sorptions") %>%
+  summarise(mean = mean(n_sorptions), .groups = "drop") %>%
+  pull(mean)
+
+dt_vec <- HA_tidy %>%
+  filter(HA_parameter == "Гемоперфузия 1", !is.na(HA_start_dt)) %>%
+  pull(HA_start_dt)
+
+period_txt <- if (length(dt_vec) == 0L) {
+  "n/a"
+} else {
+  paste0(
+    format(as.Date(min(dt_vec), tz = "UTC"), "%d.%m.%Y"),
+    "–",
+    format(as.Date(max(dt_vec), tz = "UTC"), "%d.%m.%Y")
+  )
+}
+
+table1 <- tibble(
+  Показатель = c(
+    "Период",
+    "Пациентов",
+    "Центров",
+    "Сорбций CT",
+    "Сорбций LPS",
+    "Сорбций LPS NEO",
+    "Сорбций на пациента в среднем"
+  ),
+  Значение = c(
+    period_txt,
+    fmt_int(n_pat),
+    fmt_int(n_centers),
+    fmt_int(cartridge_counts$n_ct),
+    fmt_int(cartridge_counts$n_lps),
+    fmt_int(cartridge_counts$n_lps_neo),
+    fmt_2(mean_sorp)
+  )
+)
+
+flx1 <- table1 %>%
+  flextable() %>%
+  autofit()
+
+save_as_pptx(
+  flx1,
+  path = file.path(TABLES_DIR, "table1_general.pptx")
+) %>%
+  invisible()
+
+flx1
+```
+
+# Slide 2. Baseline patient characteristics by first sorption type
+
+```{r}
+#| label: pptx-slide2
+
+tp0 <- "m12h_0h"
+
+pt0 <- patients_tidy %>%
+  filter(timepoint == tp0) %>%
+  distinct(pat_record_id, .keep_all = TRUE)
+
+assert_columns(pt0, "first_sorption_type", "patients_tidy baseline")
+
+vars_base <- c(
+  "first_sorption_type",
+  "age_yr",
+  "sex",
+  "icu_to_HA1_hours",
+  "SOFA",
+  "VIS2020_0_excl",
+  "PaFiO2_calc",
+  "procalcitonin",
+  "C_react_protein",
+  "lymphocytes",
+  "thrombocytes",
+  "lactate"
+)
+
+tbl_base <- pt0 %>%
+  select(any_of(vars_base)) %>%
+  tbl_summary(
+    by = first_sorption_type,
+    type = list(
+      age_yr ~ "continuous",
+      icu_to_HA1_hours ~ "continuous",
+      SOFA ~ "continuous",
+      VIS2020_0_excl ~ "continuous",
+      PaFiO2_calc ~ "continuous",
+      procalcitonin ~ "continuous",
+      C_react_protein ~ "continuous",
+      lymphocytes ~ "continuous",
+      thrombocytes ~ "continuous",
+      lactate ~ "continuous",
+      sex ~ "categorical"
+    ),
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{p}% ({n})"
+    ),
+    label = list(
+      age_yr = "Возраст (лет)",
+      sex = "Пол",
+      icu_to_HA1_hours = "От поступления в ОРИТ до начала ГС, ч",
+      SOFA = "SOFA",
+      VIS2020_0_excl = "Индекс VIS2020 (исходное VIS > 0)",
+      PaFiO2_calc = "Индекс оксигенации (PaO2/FiO2)",
+      procalcitonin = "Прокальцитонин",
+      C_react_protein = "C-реактивный белок",
+      lymphocytes = "Лимфоциты",
+      thrombocytes = "Тромбоциты",
+      lactate = "Лактат"
+    ),
+    missing = "no"
+  ) %>%
+  modify_header(all_stat_cols() ~ "**{level}**, N = {n}") %>%
+  bold_labels()
+
+tbl_indications <- NULL
+if ("is_septic" %in% names(pt0)) {
+  pt0_septic <- pt0 %>%
+    transmute(
+      first_sorption_type,
+      is_septic_cat = case_when(
+        is_septic == 1 ~ "Септические",
+        is_septic == 0 ~ "Асептические",
+        TRUE ~ NA_character_
+      ) %>%
+        factor(levels = c("Септические", "Асептические"))
+    )
+
+  tbl_indications <- pt0_septic %>%
+    tbl_summary(
+      by = first_sorption_type,
+      type = list(is_septic_cat ~ "categorical"),
+      statistic = list(all_categorical() ~ "{n} ({p}%)"),
+      label = list(is_septic_cat = "Септические / асептические"),
+      missing = "no"
+    ) %>%
+    modify_header(all_stat_cols() ~ "**{level}**, N = {n}") %>%
+    bold_labels()
+}
+
+tbl_path <- NULL
+if ("pat_gram_stain" %in% names(pt0)) {
+  pt0_path <- pt0 %>%
+    mutate(pat_gram_stain_slide = pat_gram_stain_for_tables(pat_gram_stain))
+
+  if (any(!is.na(pt0_path$pat_gram_stain_slide))) {
+    tbl_path <- pt0_path %>%
+      select(first_sorption_type, pat_gram_stain_slide) %>%
+      tbl_summary(
+        by = first_sorption_type,
+        type = all_categorical() ~ "categorical",
+        statistic = all_categorical() ~ "{n} ({p}%)",
+        label = list(pat_gram_stain_slide = "Бактериальная флора по Граму"),
+        missing = "no"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**, N = {n}") %>%
+      bold_labels()
+  }
+}
+
+tbl_list <- list(tbl_base)
+hdrs <- "Исходные по пациентам"
+
+if (!is.null(tbl_indications)) {
+  tbl_list <- append(tbl_list, list(tbl_indications))
+  hdrs <- c(hdrs, "Показания к гемосорбции")
+}
+
+if (!is.null(tbl_path)) {
+  tbl_list <- append(tbl_list, list(tbl_path))
+  hdrs <- c(hdrs, "Бактериальная флора по Граму")
+}
+
+tbl2 <- tbl_stack(tbl_list, group_header = hdrs)
+
+if (!is.null(tbl2$table_body) && "groupname" %in% names(tbl2$table_body)) {
+  tbl2$table_body <- tbl2$table_body %>%
+    mutate(label = if_else(row_type == "group_header", groupname, label)) %>%
+    select(-groupname)
+
+  if (!is.null(tbl2$table_header) && "column" %in% names(tbl2$table_header)) {
+    tbl2$table_header <- tbl2$table_header %>%
+      filter(column != "groupname")
+  }
+}
+
+flx2 <- as_flex_table(tbl2)
+
+# В PPTX исходные показатели делим на два слайда; показания и флора
+# получают отдельные слайды. Полная объединенная таблица остается в HTML.
+tbl_base_part1_vars <- c(
+  "age_yr", "sex", "icu_to_HA1_hours", "SOFA", "VIS2020_0_excl", "PaFiO2_calc"
+)
+tbl_base_part2_vars <- c(
+  "procalcitonin", "C_react_protein", "lymphocytes", "thrombocytes", "lactate"
+)
+
+tbl2_pptx_parts <- list(
+  tbl_base %>%
+    modify_table_body(
+      ~ dplyr::filter(.x, .data$variable %in% tbl_base_part1_vars)
+    ) %>%
+    as_flex_table() %>%
+    style_summary_pptx(),
+  tbl_base %>%
+    modify_table_body(
+      ~ dplyr::filter(.x, .data$variable %in% tbl_base_part2_vars)
+    ) %>%
+    as_flex_table() %>%
+    style_summary_pptx()
+)
+
+if (!is.null(tbl_indications)) {
+  tbl2_pptx_parts[["Показания к гемосорбции"]] <-
+    as_flex_table(tbl_indications) %>% style_summary_pptx()
+}
+
+if (!is.null(tbl_path)) {
+  tbl2_pptx_parts[["Бактериальная флора по Граму"]] <-
+    as_flex_table(tbl_path) %>% style_summary_pptx()
+}
+
+save_as_pptx(
+  values = unname(tbl2_pptx_parts),
+  path = file.path(TABLES_DIR, "table2_patients.pptx")
+) %>%
+  invisible()
+
+flx2
+```
+
+# Slide 2a. Baseline characteristics with LPS and LPS NEO combined
+
+```{r}
+#| label: pptx-slide2-lps-total
+
+pt0_total <- patients_tidy %>%
+  filter(timepoint == tp0) %>%
+  distinct(pat_record_id, .keep_all = TRUE) %>%
+  mutate(
+    first_sorption_type_total = case_when(
+      first_sorption_type %in% c("LPS", "LPS NEO") ~ "LPS TOTAL",
+      TRUE ~ as.character(first_sorption_type)
+    )
+  )
+
+group_levels <- c(
+  "LPS TOTAL",
+  pt0_total %>%
+    pull(first_sorption_type_total) %>%
+    unique() %>%
+    sort() %>%
+    setdiff("LPS TOTAL")
+)
+
+group_levels <- group_levels %>%
+  unique() %>%
+  intersect(unique(pt0_total$first_sorption_type_total))
+
+pt0_total <- pt0_total %>%
+  mutate(
+    first_sorption_type_total = factor(first_sorption_type_total, levels = group_levels),
+    vasopressors_if_used = case_when(
+      str_to_lower(vasopressors_if_used) == "да" ~ "Да",
+      str_to_lower(vasopressors_if_used) == "нет" ~ "Нет",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("Да", "Нет")),
+    HA1_start_dt = first_sorption_dt,
+    RRT_if_used_slide = case_when(
+      is.na(RRT_start_dt) ~ "Нет",
+      is.na(HA1_start_dt) ~ NA_character_,
+      HA1_start_dt >= (RRT_start_dt - hours(12)) &
+        (is.na(RRT_resolution_dt) | HA1_start_dt <= RRT_resolution_dt) ~ "Да",
+      TRUE ~ "Нет"
+    ) %>% factor(levels = c("Да", "Нет")),
+    MV_if_used_slide = case_when(
+      is.na(MV_start_dt) ~ "Нет",
+      is.na(HA1_start_dt) ~ NA_character_,
+      HA1_start_dt >= (MV_start_dt - hours(12)) &
+        (is.na(MV_resolution_dt) | HA1_start_dt <= MV_resolution_dt) ~ "Да",
+      TRUE ~ "Нет"
+    ) %>% factor(levels = c("Да", "Нет"))
+  )
+
+vars_base_total <- c(
+  "first_sorption_type_total",
+  "age_yr",
+  "sex",
+  "icu_to_HA1_hours",
+  "SOFA",
+  "VIS2020_0_excl",
+  "PaFiO2_calc",
+  "procalcitonin",
+  "C_react_protein",
+  "lymphocytes",
+  "thrombocytes",
+  "lactate",
+  "vasopressors_if_used",
+  "RRT_if_used_slide",
+  "MV_if_used_slide"
+)
+
+tbl_base_total <- pt0_total %>%
+  select(any_of(vars_base_total)) %>%
+  tbl_summary(
+    by = first_sorption_type_total,
+    type = list(
+      age_yr ~ "continuous",
+      icu_to_HA1_hours ~ "continuous",
+      SOFA ~ "continuous",
+      VIS2020_0_excl ~ "continuous",
+      PaFiO2_calc ~ "continuous",
+      procalcitonin ~ "continuous",
+      C_react_protein ~ "continuous",
+      lymphocytes ~ "continuous",
+      thrombocytes ~ "continuous",
+      lactate ~ "continuous",
+      sex ~ "categorical",
+      vasopressors_if_used ~ "dichotomous",
+      RRT_if_used_slide ~ "dichotomous",
+      MV_if_used_slide ~ "dichotomous"
+    ),
+    value = list(
+      vasopressors_if_used ~ "Да",
+      RRT_if_used_slide ~ "Да",
+      MV_if_used_slide ~ "Да"
+    ),
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{p}% ({n})"
+    ),
+    label = list(
+      age_yr = "Возраст (лет)",
+      sex = "Пол",
+      icu_to_HA1_hours = "От поступления в ОРИТ до начала ГС, ч",
+      SOFA = "SOFA",
+      VIS2020_0_excl = "Индекс VIS2020 (исходное VIS > 0)",
+      PaFiO2_calc = "Индекс оксигенации (PaO2/FiO2)",
+      procalcitonin = "Прокальцитонин",
+      C_react_protein = "C-реактивный белок",
+      lymphocytes = "Лимфоциты",
+      thrombocytes = "Тромбоциты",
+      lactate = "Лактат",
+      vasopressors_if_used = "Потребность в вазопрессорах",
+      RRT_if_used_slide = "Потребность в ЗПТ",
+      MV_if_used_slide = "Потребность в ИВЛ"
+    ),
+    missing = "no"
+  ) %>%
+  modify_header(all_stat_cols() ~ "**{level}**, N = {n}") %>%
+  bold_labels()
+
+tbl_indications_total <- NULL
+if ("is_septic" %in% names(pt0_total)) {
+  tbl_indications_total <- pt0_total %>%
+    transmute(
+      first_sorption_type_total,
+      is_septic_cat = case_when(
+        is_septic == 1 ~ "Септические",
+        is_septic == 0 ~ "Асептические",
+        TRUE ~ NA_character_
+      ) %>% factor(levels = c("Септические", "Асептические"))
+    ) %>%
+    tbl_summary(
+      by = first_sorption_type_total,
+      type = list(is_septic_cat ~ "categorical"),
+      statistic = list(all_categorical() ~ "{n} ({p}%)"),
+      label = list(is_septic_cat = "Септические / асептические"),
+      missing = "no"
+    ) %>%
+    modify_header(all_stat_cols() ~ "**{level}**, N = {n}") %>%
+    bold_labels()
+}
+
+tbl_path_total <- NULL
+if ("pat_gram_stain" %in% names(pt0_total)) {
+  pt0_path_total <- pt0_total %>%
+    mutate(pat_gram_stain_slide = pat_gram_stain_for_tables(pat_gram_stain))
+
+  if (any(!is.na(pt0_path_total$pat_gram_stain_slide))) {
+    tbl_path_total <- pt0_path_total %>%
+      select(first_sorption_type_total, pat_gram_stain_slide) %>%
+      tbl_summary(
+        by = first_sorption_type_total,
+        type = all_categorical() ~ "categorical",
+        statistic = all_categorical() ~ "{n} ({p}%)",
+        label = list(pat_gram_stain_slide = "Бактериальная флора по Граму"),
+        missing = "no"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**, N = {n}") %>%
+      bold_labels()
+  }
+}
+
+tbl_list_total <- list(tbl_base_total)
+hdrs_total <- "Исходные по пациентам"
+
+if (!is.null(tbl_indications_total)) {
+  tbl_list_total <- append(tbl_list_total, list(tbl_indications_total))
+  hdrs_total <- c(hdrs_total, "Показания к гемосорбции")
+}
+
+if (!is.null(tbl_path_total)) {
+  tbl_list_total <- append(tbl_list_total, list(tbl_path_total))
+  hdrs_total <- c(hdrs_total, "Бактериальная флора по Граму")
+}
+
+tbl2_total <- tbl_stack(tbl_list_total, group_header = hdrs_total)
+
+if (!is.null(tbl2_total$table_body) && "groupname" %in% names(tbl2_total$table_body)) {
+  tbl2_total$table_body <- tbl2_total$table_body %>%
+    mutate(label = if_else(row_type == "group_header", groupname, label)) %>%
+    select(-groupname)
+
+  if (!is.null(tbl2_total$table_header) && "column" %in% names(tbl2_total$table_header)) {
+    tbl2_total$table_header <- tbl2_total$table_header %>%
+      filter(column != "groupname")
+  }
+}
+
+flx2_total <- as_flex_table(tbl2_total)
+
+# Более широкую таблицу LPS TOTAL дополнительно делим на два клинических
+# блока; показания и флора получают собственные слайды в том же файле.
+tbl_base_total_part1_vars <- c(
+  "age_yr", "sex", "icu_to_HA1_hours", "SOFA", "VIS2020_0_excl", "PaFiO2_calc"
+)
+tbl_base_total_part2_vars <- c(
+  "procalcitonin", "C_react_protein", "lymphocytes", "thrombocytes", "lactate",
+  "vasopressors_if_used", "RRT_if_used_slide", "MV_if_used_slide"
+)
+
+tbl2_total_pptx_parts <- list(
+  "Исходные характеристики (1/2)" = tbl_base_total %>%
+    modify_table_body(
+      ~ dplyr::filter(.x, .data$variable %in% tbl_base_total_part1_vars)
+    ) %>%
+    as_flex_table() %>%
+    style_summary_pptx(),
+  "Исходные характеристики (2/2)" = tbl_base_total %>%
+    modify_table_body(
+      ~ dplyr::filter(.x, .data$variable %in% tbl_base_total_part2_vars)
+    ) %>%
+    as_flex_table() %>%
+    style_summary_pptx()
+)
+
+if (!is.null(tbl_indications_total)) {
+  tbl2_total_pptx_parts[["Показания к гемосорбции"]] <-
+    as_flex_table(tbl_indications_total) %>% style_summary_pptx()
+}
+
+if (!is.null(tbl_path_total)) {
+  tbl2_total_pptx_parts[["Бактериальная флора по Граму"]] <-
+    as_flex_table(tbl_path_total) %>% style_summary_pptx()
+}
+
+save_as_pptx(
+  values = unname(tbl2_total_pptx_parts),
+  path = file.path(TABLES_DIR, "table2_patients_lps_total.pptx")
+) %>%
+  invisible()
+
+flx2_total
+```
+
+# Slide 3. Sorption characteristics
+
+```{r}
+#| label: pptx-slide3
+
+ha_label_map <- tibble::deframe(dict_ha)
+label_list <- set_names(as.list(ha_label_map), names(ha_label_map))
+
+ha_tbl_data <- HA_tidy %>%
+  mutate(
+    HA_anticoagulation_cat = case_when(
+      HA_anticoagulation == "Цитрат" ~ "Цитрат",
+      HA_anticoagulation == "Гепарин" ~ "Гепарин",
+      HA_anticoagulation == "Другой" &
+        norm0(coalesce(HA_anticoagulation_other, "")) %in% "без антикоагуляции" ~
+        "Без антикоагуляции",
+      HA_anticoagulation == "Другой" ~ "Другой",
+      TRUE ~ "Другой"
+    ),
+    other_norm = norm0(coalesce(HA_other_methods, "")),
+    has_rrt = str_detect(other_norm, "гемодиафильтрац|гемодиализ|гемофильтрац"),
+    rrt_grp = if_else(has_rrt, "В комбинации с ЗПТ", "Изолированная гемосорбция") %>%
+      factor(levels = c("В комбинации с ЗПТ", "Изолированная гемосорбция")),
+    adverse_effects_filled = if_else(
+      {
+        x <- norm0(HA_adverse_effects)
+        !(is.na(x) | x %in% c("", "нет", "не было", "-", "—"))
+      },
+      "Да",
+      "Нет"
+    )
+  ) %>%
+  select(
+    rrt_grp,
+    HA_cartrige_type,
+    HA_duration,
+    HA_avg_blood_flow,
+    HA_anticoagulation_cat,
+    adverse_effects_filled
+  )
+
+n_all <- nrow(ha_tbl_data)
+n_rrt <- sum(ha_tbl_data$rrt_grp == "В комбинации с ЗПТ", na.rm = TRUE)
+n_iso <- sum(ha_tbl_data$rrt_grp == "Изолированная гемосорбция", na.rm = TRUE)
+
+tbl_ha_gtsummary_compact <- ha_tbl_data %>%
+  tbl_summary(
+    by = rrt_grp,
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{p}% ({n})"
+    ),
+    missing = "no",
+    sort = all_categorical() ~ "frequency",
+    label = c(
+      label_list,
+      list(
+        HA_anticoagulation_cat = ha_label_map[["HA_anticoagulation"]] %||% "Антикоагуляция",
+        adverse_effects_filled = "Нежелательные явления: указано"
+      )
+    )
+  ) %>%
+  add_overall(last = FALSE) %>%
+  modify_header(
+    label ~ "**Параметр**",
+    stat_0 ~ paste0("**All (N=", n_all, ")**"),
+    stat_1 ~ paste0("**В комбинации с ЗПТ (N=", n_rrt, ")**"),
+    stat_2 ~ paste0("**Изолированная гемосорбция (N=", n_iso, ")**")
+  ) %>%
+  modify_caption("**Сводная таблица по сорбциям**") %>%
+  bold_labels()
+
+flx3 <- tbl_ha_gtsummary_compact %>%
+  as_flex_table() %>%
+  style_summary_pptx()
+
+tbl3_part1_vars <- c(
+  "HA_cartrige_type", "HA_duration", "HA_avg_blood_flow"
+)
+tbl3_part2_vars <- c(
+  "HA_anticoagulation_cat", "adverse_effects_filled"
+)
+
+tbl3_pptx_parts <- list(
+  tbl_ha_gtsummary_compact %>%
+    modify_table_body(
+      ~ dplyr::filter(.x, .data$variable %in% tbl3_part1_vars)
+    ) %>%
+    as_flex_table() %>%
+    style_summary_pptx(),
+  tbl_ha_gtsummary_compact %>%
+    modify_table_body(
+      ~ dplyr::filter(.x, .data$variable %in% tbl3_part2_vars)
+    ) %>%
+    as_flex_table() %>%
+    style_summary_pptx()
+)
+
+save_as_pptx(
+  values = unname(tbl3_pptx_parts),
+  path = file.path(TABLES_DIR, "table3_sorptions.pptx")
+) %>%
+  invisible()
+
+flx3
+```

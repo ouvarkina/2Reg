@@ -1,0 +1,279 @@
+---
+title: "2Reg — 08c presentation plots"
+format:
+  html:
+    toc: true
+    number-sections: true
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: false
+---
+
+# Входные данные и предварительные условия
+
+Этот файл относится к блоку подготовки презентации.
+
+Необходимые входные данные считываются только из файлов:
+
+data/patients_tidy.rds — итоговый RDS-файл ETL с исходными временными точками регистра;
+data/2Reg_Dictionary_tidy.xlsx — используется только для отображения подписей.
+
+Объекты R из других QMD-файлов или ETL-скриптов повторно не используются.
+
+# Setup
+
+```{r}
+#| label: setup
+#| include: false
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggplot2)
+  library(ggh4x)
+  library(officer)
+})
+
+source("R/analysis_helpers.R")
+
+DATA_DIR <- "data"
+ANALYSIS_DATA_DIR <- file.path(DATA_DIR, "analysis")
+GRAPHES_DIR <- "graphes"
+TABLES_DIR <- "tables"
+
+dir.create(GRAPHES_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(TABLES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+patients_rds <- pick_path(c(
+  file.path(DATA_DIR, "patients_tidy.rds"),
+  file.path("/mnt/data", DATA_DIR, "patients_tidy.rds"),
+  "patients_tidy.rds"
+))
+
+dict_file <- pick_path(c(
+  file.path(DATA_DIR, "2Reg_Dictionary_tidy.xlsx"),
+  file.path("/mnt/data", DATA_DIR, "2Reg_Dictionary_tidy.xlsx"),
+  "2Reg_Dictionary_tidy.xlsx"
+))
+
+patients_tidy <- readRDS(patients_rds)
+source_timepoints <- c("m12h_0h", "48h_72h")
+patients_analysis <- patients_tidy %>%
+  filter(timepoint %in% source_timepoints) %>%
+  distinct(pat_record_id, timepoint, .keep_all = TRUE)
+
+dict <- read_dictionary_labels(dict_file)
+dict_pat <- dict %>%
+  filter(dataset == "patients", kind %in% c("static", "time"))
+```
+
+# Slide 5. Paired dynamics for LPS patients
+
+```{r}
+#| label: plots-m12h-0h-48h-72h-facet
+#| fig-width: 12
+#| fig-height: 8
+
+tp_keep <- c("m12h_0h", "48h_72h")
+
+tp_labels <- c(
+  m12h_0h = "-12-0 часов",
+  `48h_72h` = "48-72 часа"
+)
+
+var_label_map <- dict_pat %>%
+  distinct(short, ru) %>%
+  filter(!is.na(short), short != "", !is.na(ru), ru != "") %>%
+  tibble::deframe()
+
+manual_labels <- c(
+  PaFiO2_calc = "PaO2/FiO2 (расч.)",
+  VIS2020_0_excl = "VIS2020 (исходный VIS > 0)"
+)
+
+lab_var <- function(v) {
+  v <- as.character(v)
+
+  lbl_manual <- unname(manual_labels[v])
+  lbl_dict <- unname(var_label_map[v])
+
+  lbl <- ifelse(
+    !is.na(lbl_manual) & lbl_manual != "",
+    lbl_manual,
+    lbl_dict
+  )
+  lbl[is.na(lbl) | lbl == ""] <- v[is.na(lbl) | lbl == ""]
+  lbl
+}
+
+vars_facet_keep <- c(
+  "SOFA",
+  "VIS2020_0_excl",
+  "PaFiO2_calc",
+  "lactate"
+)
+vars_plot <- intersect(vars_facet_keep, names(patients_analysis))
+
+plot_source <- patients_analysis %>%
+  filter(first_sorption_type == "LPS") %>%
+  select(pat_record_id, timepoint, any_of(vars_plot))
+
+plot_long <- plot_source %>%
+  pivot_longer(
+    cols = -c(pat_record_id, timepoint),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+mutate(
+  timepoint = factor(timepoint, levels = tp_keep),
+  variable_chr = as.character(variable),
+  value_raw = as.numeric(value),
+
+  # Для лактата оставляем log10 и исключаем неположительные значения.
+  # Для VIS2020 используем pseudo-log, поэтому нули сохраняются.
+  value_plot = if_else(
+    variable_chr == "lactate" &
+      !is.na(value_raw) &
+      value_raw <= 0,
+    NA_real_,
+    value_raw
+  ),
+  variable_label = lab_var(variable_chr),
+    variable_facet = case_when(
+      variable_chr == "VIS2020_0_excl" ~ paste0(variable_label, " (псевдолог. шкала)"),
+      variable_chr == "lactate" ~ paste0(variable_label, " (шкала log10)"),
+      TRUE ~ variable_label
+    )
+  ) %>%
+  filter(!is.na(value_plot))
+
+plot_long_paired <- plot_long %>%
+  group_by(variable_facet, pat_record_id) %>%
+  filter(n_distinct(timepoint) == 2, n() == 2) %>%
+  ungroup()
+
+plot_lines <- plot_long_paired
+
+pvals_df <- plot_long_paired %>%
+  group_by(variable_facet) %>%
+  group_modify(function(.x, .y) {
+    w <- .x %>%
+      select(pat_record_id, timepoint, value_raw) %>%
+      pivot_wider(names_from = timepoint, values_from = value_raw)
+
+    enough_pairs <-
+      nrow(w) >= 2 &&
+      all(tp_keep %in% names(w)) &&
+      sum(!is.na(w[[tp_keep[1]]]) & !is.na(w[[tp_keep[2]]])) >= 2
+
+    p_value_txt <- if (enough_pairs) {
+      pval <- suppressWarnings(
+        wilcox.test(
+          x = w[[tp_keep[2]]],
+          y = w[[tp_keep[1]]],
+          paired = TRUE,
+          exact = FALSE
+        )$p.value
+      )
+      p_formatted <- format.pval(pval, digits = 2, eps = 1e-3)
+      if (startsWith(p_formatted, "<")) {
+        paste0("p ", p_formatted)
+      } else {
+        paste0("p = ", p_formatted)
+      }
+    } else {
+      "p = NA"
+    }
+
+    tibble(
+      n_pairs = nrow(w),
+      p_txt = paste0("n = ", nrow(w), ", ", p_value_txt)
+    )
+  }) %>%
+  ungroup()
+
+vis_pseudo_log_facet <- paste0(
+  lab_var("VIS2020_0_excl"),
+  " (псевдолог. шкала)"
+)
+lactate_log_facet <- paste0(lab_var("lactate"), " (шкала log10)")
+
+p <- ggplot(plot_long_paired, aes(x = timepoint, y = value_plot)) +
+  geom_boxplot(aes(fill = timepoint), outlier.shape = NA, alpha = 0.55) +
+  geom_line(data = plot_lines, aes(group = pat_record_id), alpha = 0.20) +
+  geom_point(
+    position = position_jitter(width = 0.008, height = 0),
+    size = 0.9,
+    alpha = 0.35
+  ) +
+  facet_wrap(~ variable_facet, scales = "free_y", ncol = 2) +
+  scale_x_discrete(labels = tp_labels) +
+  geom_text(
+    data = pvals_df,
+    aes(x = tp_keep[2], y = Inf, label = p_txt),
+    inherit.aes = FALSE,
+    hjust = 1.05,
+    vjust = 1.2,
+    size = 3
+  ) +
+  ggh4x::facetted_pos_scales(
+    y = list(
+      variable_facet == vis_pseudo_log_facet ~ scale_y_continuous(
+        trans = scales::pseudo_log_trans(base = 10, sigma = 1),
+        expand = expansion(mult = c(0.1, 0.1))
+      ),
+      variable_facet == lactate_log_facet ~ scale_y_log10(
+        expand = expansion(mult = c(0.1, 0.1))
+      ),
+      TRUE ~ scale_y_continuous(
+        expand = expansion(mult = c(0.05, 0.1))
+      )
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    title = "Парные сравнения (только LPS)",
+    subtitle = "Число полных пар (n) и p-value указаны отдельно для каждой панели"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+p
+
+ggplot2::ggsave(
+  filename = file.path(GRAPHES_DIR, "slide5_facets.png"),
+  plot = p,
+  width = 13.33,
+  height = 7.5,
+  units = "in",
+  dpi = 300
+)
+
+ppt <- officer::read_pptx()
+lsum <- officer::layout_summary(ppt)
+
+ppt <- ppt %>%
+  officer::add_slide(
+    layout = lsum$layout[[1]],
+    master = lsum$master[[1]]
+  ) %>%
+  officer::ph_with(
+    value = officer::external_img(
+      file.path(GRAPHES_DIR, "slide5_facets.png"),
+      width = 13.33,
+      height = 7.5
+    ),
+    location = officer::ph_location_fullsize()
+  )
+
+print(
+  ppt,
+  target = file.path(TABLES_DIR, "slide5_facets.pptx")
+)
+```

@@ -1,0 +1,923 @@
+---
+title: "2Reg — outcomes and outcome models"
+format:
+  html:
+    toc: true
+    number-sections: true
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: false
+---
+
+# Входные данные и предварительные условия
+
+Необходимые входные данные:
+
+data/patients_tidy.rds, полученный на этапе ETL;
+data/HA_tidy.rds, полученный на этапе ETL.
+
+В сводках исходов, зависящих от изменения показателей между исходной и последующей точками, используются исходные строки регистра m12h_0h и 48h_72h из patients_tidy. 
+
+Числовой показатель исхода (outcome_propensity) остаётся аналитическим показателем, рассчитываемым в 03b, и в этом файле не пересчитывается.
+
+Логика анализа на этом этапе рефакторинга включает:
+
+бинарную логистическую регрессию для сравнения смерти и отсутствия смерти;
+модели с использованием возраста, SOFA, типа и сроков первой сорбции, а также времени до первой LPS-сорбции;
+простое 30-дневное сравнение методом Каплана–Майера;
+landmark-анализ с контрольной точкой 24 часа и наблюдением до 28-го дня;
+сравнение 28-дневной летальности при раннем и позднем проведении первой сорбции;
+сводки исходов для презентации, при этом 28-дневный статус берётся из ETL, а пациенты с неизвестным 28-дневным исходом исключаются из знаменателя при расчёте летальности.
+
+# Setup
+
+```{r}
+#| label: setup
+#| include: false
+#| cache: false
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(tibble)
+  library(ggplot2)
+  library(gtsummary)
+  library(survival)
+  library(ggsurvfit)
+})
+
+source("R/analysis_helpers.R")
+
+DATA_DIR <- "data"
+ANALYSIS_DATA_DIR <- file.path(DATA_DIR, "analysis")
+GRAPHES_DIR <- "graphes"
+dir.create(ANALYSIS_DATA_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(GRAPHES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+patients_rds <- pick_path(c(
+  file.path(DATA_DIR, "patients_tidy.rds"),
+  file.path("/mnt/data", DATA_DIR, "patients_tidy.rds"),
+  "patients_tidy.rds"
+))
+
+ha_rds <- pick_path(c(
+  file.path(DATA_DIR, "HA_tidy.rds"),
+  file.path("/mnt/data", DATA_DIR, "HA_tidy.rds"),
+  "HA_tidy.rds"
+))
+
+patients_tidy <- readRDS(patients_rds)
+HA_tidy <- readRDS(ha_rds)
+
+assert_columns(
+  patients_tidy,
+  c(
+    "pat_record_id", "timepoint", "outcome", "age_yr", "SOFA",
+    "icu_to_HA1_hours", "ICU_to_first_LPS", "first_sorption_type",
+    "ICU_in_dt", "ICU_out_or_death_dt", "outcome_days",
+    "outcome_dead_bin", "outcome_survival_bin", "outcome_dead_all_bin",
+    "outcome_logit", "outcome_28d_status", "outcome_death_28d_bin",
+    "VIS2020_0_excl", "HA_efficency_CGI_E",
+    "from_other_ICU_transfer", "INR"
+  ),
+  "patients_tidy"
+)
+
+assert_columns(
+  HA_tidy,
+  c(
+    "pat_record_id", "HA_parameter", "HA_start_dt",
+    "HA_anticoagulation_cat"
+  ),
+  "HA_tidy"
+)
+
+tp0 <- "m12h_0h"
+tp1 <- "48h_72h"
+```
+
+# Outcome QC
+
+```{r}
+#| label: outcome-qc
+
+outcome_qc <- patients_tidy %>%
+  group_by(pat_record_id) %>%
+  summarise(
+    outcome = first_non_empty(outcome),
+    ICU_in_dt = first_non_na(ICU_in_dt),
+    ICU_out_or_death_dt = first_non_na(ICU_out_or_death_dt),
+    outcome_days = first_non_na(outcome_days),
+    outcome_28d_status = first_non_na(outcome_28d_status),
+    outcome_death_28d_bin = first_non_na(outcome_death_28d_bin),
+    .groups = "drop"
+  )
+
+outcome_qc %>%
+  count(outcome, name = "n_patients")
+
+outcome_qc %>%
+  count(outcome_28d_status, name = "n_patients", .drop = FALSE)
+
+outcome_qc %>%
+  summarise(
+    n_patients = n(),
+    n_missing_outcome = sum(is.na(outcome)),
+    n_missing_terminal_dt = sum(is.na(ICU_out_or_death_dt)),
+    n_negative_outcome_time = sum(outcome_days < 0, na.rm = TRUE)
+  )
+```
+
+# Outcome summary from source registry timepoints
+
+The outcome table below uses the source `m12h_0h` and `48h_72h` rows. It preserves the old outcome definitions used in the presentation analysis.
+
+```{r}
+#| label: build-outcome-summary-data
+#| include: false
+
+out_df <- patients_tidy %>%
+  filter(timepoint %in% c(tp0, tp1)) %>%
+  distinct(pat_record_id, timepoint, .keep_all = TRUE) %>%
+  group_by(pat_record_id) %>%
+  summarise(
+    first_sorption_type = first_non_na(first_sorption_type),
+    from_other_ICU_transfer = first_non_na(from_other_ICU_transfer),
+    INR_m12 = suppressWarnings(as.numeric(first_non_na(INR[timepoint == tp0]))),
+    outcome_raw = first_non_na(outcome),
+    outcome_dead_all_bin = first_non_na(outcome_dead_all_bin),
+    outcome_28d_status = first_non_na(outcome_28d_status),
+    outcome_death_28d_bin = first_non_na(outcome_death_28d_bin),
+    outcome_days = first_non_na(outcome_days),
+    CGI_E_raw = first_non_na(HA_efficency_CGI_E),
+    ICU_in_dt = first_non_na(ICU_in_dt),
+    ICU_out_or_death_dt = first_non_na(ICU_out_or_death_dt),
+    SOFA_m12 = first_non_na(SOFA[timepoint == tp0]),
+    SOFA_48_72 = first_non_na(SOFA[timepoint == tp1]),
+    VIS_m12 = first_non_na(VIS2020_0_excl[timepoint == tp0]),
+    VIS_48_72 = first_non_na(VIS2020_0_excl[timepoint == tp1]),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    outcome_norm = norm_txt(outcome_raw),
+
+    time_to_icu_discharge_h = case_when(
+      outcome_norm == "Выписан из ОРИТ" &
+        !is.na(outcome_days) ~ outcome_days * 24,
+      TRUE ~ NA_real_
+    ),
+
+    CGI_E_2lvl = {
+      x <- norm_txt(CGI_E_raw)
+      case_when(
+        x %in% c(
+          "Без изменений или хуже",
+          "Минимальное улучшение. Незначительное улучшение, не влияющее на клинический статус пациента"
+        ) ~ "Нет улучшений",
+        x %in% c(
+          "Отмечено значительное улучшение. Полная или почти полная ремиссия симптомов",
+          "Умеренное улучшение. Частичная ремиссия симптомов"
+        ) ~ "Есть улучшения",
+        TRUE ~ NA_character_
+      ) %>%
+        factor(levels = c("Есть улучшения", "Нет улучшений"))
+    },
+
+    SOFA_drop_2plus = case_when(
+      !is.na(SOFA_m12) & !is.na(SOFA_48_72) ~
+        (SOFA_m12 - SOFA_48_72 >= 2),
+      TRUE ~ NA
+    ) %>%
+      factor(levels = c(TRUE, FALSE), labels = c("Да", "Нет")),
+
+    VIS_drop_20plus = case_when(
+      !is.na(VIS_m12) & !is.na(VIS_48_72) ~
+        (VIS_m12 - VIS_48_72 >= 20),
+      TRUE ~ NA
+    ) %>%
+      factor(levels = c(TRUE, FALSE), labels = c("Да", "Нет")),
+
+    mortality = case_when(
+      outcome_death_28d_bin == 1L ~ "Умер",
+      outcome_death_28d_bin == 0L ~ "Жив",
+      TRUE ~ NA_character_
+    ) %>%
+      factor(levels = c("Умер", "Жив")),
+
+    INR_group = case_when(
+      !is.na(INR_m12) & INR_m12 < 1.4 ~ "МНО < 1.4",
+      !is.na(INR_m12) & INR_m12 >= 1.4 ~ "МНО ≥ 1.4",
+      TRUE ~ NA_character_
+    ) %>%
+      factor(levels = c("МНО < 1.4", "МНО ≥ 1.4"))
+  )
+
+make_outcome_tbl <- function(df, by_var = NULL, caption = NULL) {
+  vars_keep <- c(
+    by_var,
+    "time_to_icu_discharge_h",
+    "CGI_E_2lvl",
+    "SOFA_drop_2plus",
+    "VIS_drop_20plus",
+    "mortality"
+  )
+
+  x <- df %>%
+    select(any_of(vars_keep))
+
+  if (is.null(by_var)) {
+    tbl <- x %>%
+      tbl_summary(
+        type = list(
+          CGI_E_2lvl ~ "dichotomous",
+          SOFA_drop_2plus ~ "dichotomous",
+          VIS_drop_20plus ~ "dichotomous",
+          mortality ~ "dichotomous"
+        ),
+        value = list(
+          CGI_E_2lvl ~ "Есть улучшения",
+          SOFA_drop_2plus ~ "Да",
+          VIS_drop_20plus ~ "Да",
+          mortality ~ "Умер"
+        ),
+        statistic = list(
+          time_to_icu_discharge_h ~ "{median} ({p25}, {p75})",
+          all_categorical() ~ "{n} ({p}%)"
+        ),
+        label = list(
+          time_to_icu_discharge_h = "Время до выписки из ОРИТ, ч",
+          CGI_E_2lvl = "CGI-E: есть улучшения",
+          SOFA_drop_2plus = "Снижение SOFA ≥ 2 за 72 ч",
+          VIS_drop_20plus = "Снижение VIS2020 ≥ 20 за 72 ч (исходное VIS > 0)",
+          mortality = "28-дневная летальность (% среди известных исходов)"
+        ),
+        missing = "no"
+      )
+  } else {
+    tbl <- x %>%
+      tbl_summary(
+        by = all_of(by_var),
+        type = list(
+          CGI_E_2lvl ~ "dichotomous",
+          SOFA_drop_2plus ~ "dichotomous",
+          VIS_drop_20plus ~ "dichotomous",
+          mortality ~ "dichotomous"
+        ),
+        value = list(
+          CGI_E_2lvl ~ "Есть улучшения",
+          SOFA_drop_2plus ~ "Да",
+          VIS_drop_20plus ~ "Да",
+          mortality ~ "Умер"
+        ),
+        statistic = list(
+          time_to_icu_discharge_h ~ "{median} ({p25}, {p75})",
+          all_categorical() ~ "{n} ({p}%)"
+        ),
+        label = list(
+          time_to_icu_discharge_h = "Время до выписки из ОРИТ, ч",
+          CGI_E_2lvl = "CGI-E: есть улучшения",
+          SOFA_drop_2plus = "Снижение SOFA ≥ 2 за 72 ч",
+          VIS_drop_20plus = "Снижение VIS2020 ≥ 20 за 72 ч (исходное VIS > 0)",
+          mortality = "28-дневная летальность (% среди известных исходов)"
+        ),
+        missing = "no"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**, N = {n}")
+  }
+
+  if (!is.null(caption)) {
+    tbl <- tbl %>% modify_caption(caption)
+  }
+
+  tbl %>% bold_labels()
+}
+```
+
+## All patients
+
+```{r}
+#| label: outcomes-all
+
+make_outcome_tbl(
+  out_df,
+  caption = "**Исходы: все пациенты**"
+)
+```
+
+## Outcomes by first sorption type
+
+```{r}
+#| label: outcomes-by-first-type
+
+tbl_outcomes_by_type <- make_outcome_tbl(
+  out_df %>% filter(!is.na(first_sorption_type)),
+  by_var = "first_sorption_type",
+  caption = "**Исходы по типу первой сорбции**"
+)
+
+tbl_outcomes_by_type
+```
+
+## Outcomes: all patients vs excluding transfers from another ICU
+
+```{r}
+#| label: outcomes-transfer
+
+tbl_outcomes_all <- make_outcome_tbl(out_df)
+
+tbl_outcomes_no_transfer <- make_outcome_tbl(
+  out_df %>%
+    filter(from_other_ICU_transfer != "Да" | is.na(from_other_ICU_transfer))
+)
+
+tbl_outcomes_transfer_compare <- tbl_merge(
+  tbls = list(tbl_outcomes_all, tbl_outcomes_no_transfer),
+  tab_spanner = c(
+    paste0("**Все пациенты**, N = ", nrow(out_df)),
+    paste0(
+      "**Без перевода из другого ОРИТ**, N = ",
+      out_df %>%
+        filter(from_other_ICU_transfer != "Да" | is.na(from_other_ICU_transfer)) %>%
+        nrow()
+    )
+  )
+)
+
+tbl_outcomes_transfer_compare
+```
+
+## Outcomes by baseline INR
+
+```{r}
+#| label: outcomes-inr
+
+tbl_outcomes_inr <- make_outcome_tbl(
+  out_df %>% filter(!is.na(INR_group)),
+  by_var = "INR_group",
+  caption = "**Исходы в зависимости от МНО на T0**"
+)
+
+tbl_outcomes_inr
+```
+
+## Outcomes: early vs late first LPS sorption
+
+```{r}
+#| label: outcomes-early-late-lps
+
+# Preserve the old presentation setting: only LPS procedures.
+outcomes_early_late_lps_only <- TRUE
+
+ha_first_sorption_src <- HA_tidy %>%
+  filter(HA_parameter == "Гемоперфузия 1")
+
+if (outcomes_early_late_lps_only) {
+  if (!"HA_cartrige_type_std" %in% names(ha_first_sorption_src)) {
+    stop("В HA_tidy нет колонки HA_cartrige_type_std для LPS-фильтра.")
+  }
+
+  ha_first_sorption_src <- ha_first_sorption_src %>%
+    filter(HA_cartrige_type_std == "LPS")
+}
+
+ha_first_sorption_timing <- ha_first_sorption_src %>%
+  filter(!is.na(HA_start_dt)) %>%
+  arrange(pat_record_id, HA_start_dt) %>%
+  group_by(pat_record_id) %>%
+  summarise(
+    HA_start_dt = first_non_na(HA_start_dt),
+    HA_cartrige_type_std = first_non_na(HA_cartrige_type_std),
+    .groups = "drop"
+  )
+
+out_df_early_late <- out_df %>%
+  inner_join(ha_first_sorption_timing, by = "pat_record_id") %>%
+  filter(!is.na(ICU_in_dt), !is.na(HA_start_dt)) %>%
+  mutate(
+    HA_start_timing = case_when(
+      HA_start_dt <= ICU_in_dt + lubridate::hours(24) ~ "Ранняя (≤24 ч)",
+      HA_start_dt > ICU_in_dt + lubridate::hours(24) ~ "Поздняя (>24 ч)",
+      TRUE ~ NA_character_
+    ) %>%
+      factor(levels = c("Ранняя (≤24 ч)", "Поздняя (>24 ч)"))
+  ) %>%
+  filter(!is.na(HA_start_timing))
+
+tbl_outcomes_early_late <- make_outcome_tbl(
+  out_df_early_late,
+  by_var = "HA_start_timing",
+  caption = "**Исходы в зависимости от ранней/поздней первой гемосорбции (только LPS)**"
+)
+
+tbl_outcomes_early_late
+```
+
+# Baseline dataset for logistic models
+
+```{r}
+#| label: logit-baseline
+
+df_base <- patients_tidy %>%
+  filter(timepoint == "m12h_0h") %>%
+  distinct(pat_record_id, .keep_all = TRUE) %>%
+  filter(!is.na(outcome_logit))
+
+df_base %>%
+  count(outcome_logit, name = "n")
+```
+
+# Logistic model A: first sorption type and SOFA × timing
+
+```{r}
+#| label: logit-a
+
+# SIC_score/SIC_positive are intentionally not added together with SOFA,
+# because SIC itself uses SOFA, INR and thrombocytes.
+
+df_logit_type <- df_base %>%
+  mutate(first_sorption_type = factor(first_sorption_type, levels = c("CT", "LPS"))) %>%
+  filter(
+    !is.na(first_sorption_type),
+    !is.na(icu_to_HA1_hours),
+    !is.na(SOFA),
+    !is.na(age_yr),
+    icu_to_HA1_hours > 0,
+    icu_to_HA1_hours < 240
+  )
+
+model_logit_type <- glm(
+  outcome_logit ~ age_yr + first_sorption_type + SOFA * I(icu_to_HA1_hours / 5),
+  data = df_logit_type,
+  family = binomial(link = "logit")
+)
+
+tbl_logit_type <- tbl_regression(
+  model_logit_type,
+  exponentiate = TRUE,
+  label = list(
+    `I(icu_to_HA1_hours/5)` ~ "Время между поступлением в ОРИТ и началом ГС (на 5 ч)",
+    SOFA ~ "SOFA",
+    `SOFA:I(icu_to_HA1_hours/5)` ~ "Взаимодействие: SOFA × время до начала ГС",
+    age_yr ~ "Возраст (полных лет)",
+    first_sorption_type ~ "Тип первой сорбции (Гемоперфузия 1)"
+  )
+) %>%
+  bold_labels()
+
+tbl_logit_type
+
+# Preserve the old prediction-QC block exactly as an auxiliary check.
+type_ref <- names(sort(table(df_logit_type$first_sorption_type), decreasing = TRUE))[[1]]
+
+p_type <- tibble(
+  icu_to_HA1_hours = c(0, 1, 3, 5),
+  SOFA = median(df_logit_type$SOFA, na.rm = TRUE),
+  age_yr = median(df_logit_type$age_yr, na.rm = TRUE),
+  first_sorption_type = factor(
+    type_ref,
+    levels = levels(df_logit_type$first_sorption_type)
+  )
+) %>%
+  mutate(
+    p_death = predict(model_logit_type, newdata = ., type = "response"),
+    p_not_death = 1 - p_death
+  )
+
+p_type
+```
+
+# Logistic model B: time to first LPS
+
+```{r}
+#| label: logit-b
+
+df_logit_lps <- df_base %>%
+  filter(
+    !is.na(ICU_to_first_LPS),
+    !is.na(icu_to_HA1_hours),
+    !is.na(SOFA),
+    !is.na(age_yr)
+  )
+
+model_logit_lps <- glm(
+  outcome_logit ~ SOFA + age_yr + I(ICU_to_first_LPS / 5),
+  data = df_logit_lps,
+  family = binomial(link = "logit")
+)
+
+tbl_logit_lps <- tbl_regression(
+  model_logit_lps,
+  exponentiate = TRUE,
+  label = list(
+    SOFA ~ "SOFA",
+    age_yr ~ "Возраст (полных лет)",
+    `I(ICU_to_first_LPS/5)` ~ "Время от ICU до первого LPS (на 5 ч)"
+  )
+) %>%
+  bold_labels()
+
+tbl_logit_lps
+
+p_lps <- tibble(
+  icu_to_HA1_hours = c(0, 1, 3, 5),
+  SOFA = median(df_logit_lps$SOFA, na.rm = TRUE),
+  age_yr = median(df_logit_lps$age_yr, na.rm = TRUE),
+  ICU_to_first_LPS = median(df_logit_lps$ICU_to_first_LPS, na.rm = TRUE)
+) %>%
+  mutate(
+    p_death = predict(model_logit_lps, newdata = ., type = "response"),
+    p_not_death = 1 - p_death
+  )
+
+p_lps
+```
+
+# Kaplan–Meier: simple 30-day comparison
+
+This reproduces the previous non-landmark comparison. The landmark analysis below is the analysis that explicitly avoids assigning patients to an “early” group using information unavailable before the landmark time.
+
+```{r}
+#| label: km-30d
+
+df_km_30 <- patients_tidy %>%
+  group_by(pat_record_id) %>%
+  summarise(
+    icu_to_HA1_hours = first_non_na(icu_to_HA1_hours),
+    outcome_days = first_non_na(outcome_days),
+    outcome_dead_all_bin = first_non_na(outcome_dead_all_bin),
+    .groups = "drop"
+  ) %>%
+  filter(
+    !is.na(icu_to_HA1_hours),
+    !is.na(outcome_days),
+    !is.na(outcome_dead_all_bin)
+  ) %>%
+  mutate(
+    time_days = outcome_days,
+    event = outcome_dead_all_bin,
+    early_start = if_else(
+      icu_to_HA1_hours < 24,
+      "Раннее (<24ч)",
+      "Позднее (≥24ч)"
+    ),
+    time_30 = pmin(time_days, 30),
+    event_30 = if_else(time_days <= 30 & event == 1L, 1L, 0L)
+  ) %>%
+  filter(!is.na(time_days), time_days >= 0)
+
+fit_30 <- survfit(
+  Surv(time_30, event_30) ~ early_start,
+  data = df_km_30
+)
+
+plot(
+  fit_30,
+  col = 1:2,
+  lwd = 2,
+  xlab = "Дни с момента поступления в ОРИТ",
+  ylab = "Вероятность выживания",
+  main = "30-дневная выживаемость: раннее vs позднее начало ГС",
+  xlim = c(0, 30)
+)
+
+legend(
+  "bottomleft",
+  legend = levels(factor(df_km_30$early_start)),
+  col = 1:2,
+  lwd = 2,
+  bty = "n"
+)
+
+logrank_30 <- survdiff(
+  Surv(time_30, event_30) ~ early_start,
+  data = df_km_30
+)
+
+logrank_30
+```
+
+# 24-hour landmark analysis to day 28
+
+The switch below is preserved from the previous analysis. With `TRUE`, patients discharged alive before day 28 are treated as alive through day 28 rather than censored on the discharge date.
+
+```{r}
+#| label: landmark-28d-24h
+
+landmark_hours <- 24
+landmark_days <- landmark_hours / 24
+max_follow_days <- 28
+max_follow_after_landmark <- max_follow_days - landmark_days
+assume_discharged_alive_to_28 <- TRUE
+
+df_landmark_raw <- patients_tidy %>%
+  group_by(pat_record_id) %>%
+  summarise(
+    icu_to_HA1_hours = first_non_na(icu_to_HA1_hours),
+    outcome_days = first_non_na(outcome_days),
+    outcome_dead_all_bin = first_non_na(outcome_dead_all_bin),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(icu_to_HA1_hours)) %>%
+  mutate(time_from_icu_days = outcome_days) %>%
+  filter(is.na(time_from_icu_days) | time_from_icu_days >= 0) %>%
+  mutate(
+    status_at_landmark = case_when(
+      !is.na(time_from_icu_days) &
+        time_from_icu_days <= landmark_days &
+        outcome_dead_all_bin == 1L ~
+        "Исключён: умер до/в landmark",
+
+      !is.na(time_from_icu_days) &
+        time_from_icu_days <= landmark_days ~
+        "Исключён: выбыл/выписан до/в landmark",
+
+      TRUE ~ "Оставлен в landmark-анализе"
+    )
+  )
+
+landmark_flow <- df_landmark_raw %>%
+  count(status_at_landmark, name = "n") %>%
+  mutate(percent = round(100 * n / sum(n), 1))
+
+landmark_flow
+
+df_landmark <- df_landmark_raw %>%
+  filter(status_at_landmark == "Оставлен в landmark-анализе") %>%
+  mutate(
+    sorption_by_landmark = case_when(
+      icu_to_HA1_hours <= landmark_hours ~
+        paste0("ГС до ", landmark_hours, " ч"),
+      TRUE ~ paste0("ГС после ", landmark_hours, " ч")
+    ),
+
+    event_landmark_28 = if_else(
+      !is.na(time_from_icu_days) &
+        outcome_dead_all_bin == 1L &
+        time_from_icu_days > landmark_days &
+        time_from_icu_days <= max_follow_days,
+      1L,
+      0L
+    ),
+
+    time_landmark_28 = case_when(
+      event_landmark_28 == 1L ~
+        time_from_icu_days - landmark_days,
+
+      assume_discharged_alive_to_28 ~
+        max_follow_after_landmark,
+
+      !is.na(time_from_icu_days) &
+        time_from_icu_days > landmark_days ~
+        pmin(time_from_icu_days, max_follow_days) - landmark_days,
+
+      TRUE ~ max_follow_after_landmark
+    ),
+
+    time_landmark_28 = pmax(time_landmark_28, 0),
+
+    sorption_by_landmark = factor(
+      sorption_by_landmark,
+      levels = c(
+        paste0("ГС до ", landmark_hours, " ч"),
+        paste0("ГС после ", landmark_hours, " ч")
+      )
+    )
+  )
+
+landmark_group_qc <- df_landmark %>%
+  count(sorption_by_landmark, name = "n")
+
+landmark_group_qc
+
+fit_landmark <- survfit2(
+  Surv(time_landmark_28, event_landmark_28) ~ sorption_by_landmark,
+  data = df_landmark
+)
+
+logrank_landmark <- survdiff(
+  Surv(time_landmark_28, event_landmark_28) ~ sorption_by_landmark,
+  data = df_landmark
+)
+
+pval_landmark <- 1 - pchisq(
+  logrank_landmark$chisq,
+  df = length(logrank_landmark$n) - 1
+)
+
+censor_label <- if (assume_discharged_alive_to_28) {
+  "Цензурировано к 28 дню"
+} else {
+  "Цензурировано/выписано"
+}
+
+p_landmark <- ggsurvfit(fit_landmark) +
+  add_confidence_interval() +
+  add_risktable(
+    risktable_stats = c("n.risk", "cum.event", "cum.censor"),
+    stats_label = list(
+      n.risk = "Осталось под риском",
+      cum.event = "Умерло",
+      cum.censor = censor_label
+    ),
+    risktable_height = 0.35
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, max_follow_after_landmark, by = 7),
+    limits = c(0, max_follow_after_landmark)
+  ) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    title = paste0(
+      "Landmark analysis: 28-дневная выживаемость от ",
+      landmark_hours,
+      " ч"
+    ),
+    subtitle = paste0(
+      "log-rank p = ",
+      format.pval(pval_landmark, digits = 2, eps = 0.001)
+    ),
+    x = paste0("Дни после landmark-точки ", landmark_hours, " ч"),
+    y = "Вероятность выживания",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_bw()
+
+p_landmark
+```
+
+# 28-day mortality: early vs late first sorption
+
+```{r}
+#| label: mortality-28d-early-late
+
+df_28 <- patients_tidy %>%
+  group_by(pat_record_id) %>%
+  summarise(
+    icu_to_HA1_hours = first_non_na(icu_to_HA1_hours),
+    outcome_28d_status = first_non_na(outcome_28d_status),
+    outcome_death_28d_bin = first_non_na(outcome_death_28d_bin),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(icu_to_HA1_hours)) %>%
+  mutate(
+    early_start = if_else(
+      icu_to_HA1_hours < 24,
+      "Раннее (<24ч)",
+      "Позднее (≥24ч)"
+    ),
+    death_28 = outcome_death_28d_bin
+  )
+
+tab_28 <- df_28 %>%
+  group_by(early_start) %>%
+  summarise(
+    N_total = n(),
+    N_known = sum(!is.na(death_28)),
+    N_unknown = sum(is.na(death_28)),
+    deaths_28 = sum(death_28 == 1L, na.rm = TRUE),
+    alive_28 = sum(death_28 == 0L, na.rm = TRUE),
+    mortality_28 = if_else(
+      N_known > 0,
+      sprintf(
+        "%.1f%% (%d/%d)",
+        100 * deaths_28 / N_known,
+        deaths_28,
+        N_known
+      ),
+      NA_character_
+    ),
+    .groups = "drop"
+  )
+
+tab_28
+
+df_28_known <- df_28 %>%
+  filter(!is.na(death_28))
+
+fisher_28_table <- table(df_28_known$early_start, df_28_known$death_28)
+fisher_28 <- if (identical(dim(fisher_28_table), c(2L, 2L))) {
+  fisher.test(fisher_28_table)
+} else {
+  NULL
+}
+
+if (is.null(fisher_28)) {
+  cat("Fisher test not calculated: the known 28-day outcomes do not form a 2 x 2 table.\n")
+} else {
+  fisher_28
+}
+```
+
+# Outcome by anticoagulation at first hemoperfusion
+
+```{r}
+#| label: outcome-by-anticoagulation
+
+ha_first_anticoag <- HA_tidy %>%
+  arrange(pat_record_id, HA_start_dt) %>%
+  group_by(pat_record_id) %>%
+  summarise(
+    HA_anticoagulation_cat = first_non_empty(HA_anticoagulation_cat),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    HA_anticoagulation_cat = factor(
+      HA_anticoagulation_cat,
+      levels = c("Гепарин", "Цитрат", "Без антикоагуляции", "Другой")
+    )
+  )
+
+pt_outcome <- patients_tidy %>%
+  group_by(pat_record_id) %>%
+  summarise(outcome = first_non_empty(outcome), .groups = "drop") %>%
+  mutate(
+    outcome = factor(
+      outcome,
+      levels = c(
+        "Выписан из ОРИТ",
+        "Продолжает находиться в ОРИТ",
+        "Переведён в другой ОРИТ",
+        "Умер"
+      )
+    )
+  )
+
+outcome_by_anticoag_df <- pt_outcome %>%
+  left_join(ha_first_anticoag, by = "pat_record_id") %>%
+  filter(!is.na(HA_anticoagulation_cat), !is.na(outcome))
+
+tbl_outcome_by_anticoag <- outcome_by_anticoag_df %>%
+  select(HA_anticoagulation_cat, outcome) %>%
+  tbl_summary(
+    by = HA_anticoagulation_cat,
+    statistic = all_categorical() ~ "{p}% ({n})",
+    missing = "no",
+    label = list(outcome = "Исход")
+  ) %>%
+  modify_header(label = "**Исход**") %>%
+  modify_header(all_stat_cols() ~ "**{level}**, N = {n}") %>%
+  modify_caption("**Исходы в зависимости от антикоагуляции при первой гемосорбции**") %>%
+  bold_labels()
+
+tbl_outcome_by_anticoag
+```
+
+# Save reusable outcome objects
+
+```{r}
+#| label: save-outcome-results
+
+outcome_results <- list(
+  out_df = out_df,
+  out_df_early_late = out_df_early_late,
+  tbl_outcomes_by_type = tbl_outcomes_by_type,
+  tbl_outcomes_transfer_compare = tbl_outcomes_transfer_compare,
+  tbl_outcomes_inr = tbl_outcomes_inr,
+  tbl_outcomes_early_late = tbl_outcomes_early_late,
+  df_base = df_base,
+  df_logit_type = df_logit_type,
+  model_logit_type = model_logit_type,
+  df_logit_lps = df_logit_lps,
+  model_logit_lps = model_logit_lps,
+  p_type = p_type,
+  p_lps = p_lps,
+  df_km_30 = df_km_30,
+  fit_30 = fit_30,
+  logrank_30 = logrank_30,
+  df_landmark = df_landmark,
+  landmark_flow = landmark_flow,
+  landmark_group_qc = landmark_group_qc,
+  pval_landmark = pval_landmark,
+  df_28 = df_28,
+  mortality_28 = tab_28,
+  fisher_28 = fisher_28,
+  tbl_outcome_by_anticoag = tbl_outcome_by_anticoag
+)
+
+saveRDS(
+  outcome_results,
+  file.path(ANALYSIS_DATA_DIR, "outcome_results.rds")
+)
+```
+
+# Final QC
+
+```{r}
+#| label: final-qc
+
+cat("patients_tidy patients:", n_distinct(patients_tidy$pat_record_id), "\n")
+cat("patients with source m12h_0h/48h_72h rows:", n_distinct(out_df$pat_record_id), "\n")
+cat("outcome-summary patients:", nrow(out_df), "\n")
+cat("logistic model A N:", nrow(df_logit_type), "\n")
+cat("logistic model B N:", nrow(df_logit_lps), "\n")
+cat("30-day KM N:", nrow(df_km_30), "\n")
+cat("24h landmark N:", nrow(df_landmark), "\n")
+cat("28-day outcome known:", sum(!is.na(df_28$death_28)), "\n")
+cat("28-day outcome unknown:", sum(is.na(df_28$death_28)), "\n")
+cat("Saved:", file.path(ANALYSIS_DATA_DIR, "outcome_results.rds"), "\n")
+```

@@ -1,0 +1,715 @@
+---
+title: "2Reg — exploratory analysis"
+format:
+  html:
+    toc: true
+    number-sections: true
+    df-print: paged
+editor: visual
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: false
+  fig-align: center
+  dev: png
+---
+
+## Требования к входным данным
+
+Перед запуском должны быть выполнены:
+
+1.  `01a_build_tidy_from_json.R`
+2.  `01b_postprocess_tidy.R`
+
+Файл читает следующие RDS:
+
+- `data/patients_tidy.rds`
+- `data/HA_tidy.rds`
+
+# Setup
+
+```{r}
+#| label: setup
+#| include: false
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(stringr)
+  library(forcats)
+  library(tibble)
+  library(ggplot2)
+  library(scales)
+})
+
+DATA_DIR <- "data"
+
+pick_path <- function(path_candidates) {
+  hit <- path_candidates[file.exists(path_candidates)][1]
+
+  if (is.na(hit)) {
+    stop(
+      "Не найден обязательный RDS: ",
+      basename(path_candidates[[1]]),
+      ". Сначала выполните 01a_build_tidy_from_json.R и 01b_postprocess_tidy.R."
+    )
+  }
+
+  hit
+}
+
+patients_rds <- pick_path(c(
+  file.path(DATA_DIR, "patients_tidy.rds"),
+  file.path("/mnt/data", DATA_DIR, "patients_tidy.rds"),
+  "patients_tidy.rds"
+))
+
+ha_rds <- pick_path(c(
+  file.path(DATA_DIR, "HA_tidy.rds"),
+  file.path("/mnt/data", DATA_DIR, "HA_tidy.rds"),
+  "HA_tidy.rds"
+))
+
+patients_tidy <- readRDS(patients_rds)
+HA_tidy <- readRDS(ha_rds)
+
+required_patient_cols <- c("pat_record_id", "timepoint")
+missing_patient_cols <- setdiff(required_patient_cols, names(patients_tidy))
+
+if (length(missing_patient_cols) > 0) {
+  stop(
+    "В patients_tidy отсутствуют обязательные колонки: ",
+    paste(missing_patient_cols, collapse = ", ")
+  )
+}
+
+# Базовые переменные, которые рассматриваем в EDA.
+# any_of() ниже позволяет файлу не падать при временном отсутствии отдельной переменной.
+eda_numeric_vars <- c(
+  "age_yr",
+  "BMI",
+  "charlson_index",
+  "SOFA",
+  "VIS2020",
+  "avg_BP",
+  "PaFiO2_calc",
+  "INR",
+  "SIC_score",
+  "lactate",
+  "creatinine",
+  "albumin",
+  "C_react_protein",
+  "procalcitonin",
+  "D_dimer",
+  "fibrinogen",
+  "bilirubin_total",
+  "leucocytes",
+  "neutrophils",
+  "lymphocytes",
+  "NLR",
+  "thrombocytes",
+  "icu_to_HA1_hours",
+  "ICU_to_antibiotics_dt",
+  "antibiotics_to_HA1_hours"
+)
+
+eda_dynamic_vars <- c(
+  "SOFA",
+  "VIS2020",
+  "avg_BP",
+  "PaFiO2_calc",
+  "INR",
+  "SIC_score",
+  "SIC_positive",
+  "lactate",
+  "creatinine",
+  "albumin",
+  "C_react_protein",
+  "procalcitonin",
+  "D_dimer",
+  "fibrinogen",
+  "bilirubin_total",
+  "leucocytes",
+  "neutrophils",
+  "lymphocytes",
+  "NLR",
+  "thrombocytes"
+)
+
+eda_categorical_vars <- c(
+  "sex",
+  "from_other_ICU_transfer",
+  "ICU_6_month_history",
+  "first_sorption_type",
+  "pat_gram_stain",
+  "is_bacteremic",
+  "is_septic",
+  "SIC_positive",
+  "outcome",
+  "HA_efficency_CGI_E"
+)
+
+# Для patient-level EDA используем исходную baseline-точку реестра.
+# Если конкретного пациента на m12h_0h нет, он не попадает в baseline EDA,
+# что отдельно отражается в таблице полноты временных точек.
+baseline_patients <- patients_tidy %>%
+  filter(timepoint == "m12h_0h") %>%
+  distinct(pat_record_id, .keep_all = TRUE)
+```
+
+# 1. Объём и структура данных
+
+## Общая сводка
+
+```{r}
+#| label: dataset-overview
+
+source_pair_counts <- patients_tidy %>%
+  filter(timepoint %in% c("m12h_0h", "48h_72h")) %>%
+  distinct(pat_record_id, timepoint) %>%
+  count(pat_record_id, name = "n_source_points") %>%
+  summarise(
+    n_patients_with_source_points = n(),
+    n_with_both_points = sum(n_source_points == 2),
+    .groups = "drop"
+  )
+
+dataset_overview <- tibble(
+  metric = c(
+    "patients_tidy: строк",
+    "patients_tidy: пациентов",
+    "patients_tidy: baseline пациентов",
+    "patients_tidy: пациентов с обеими исходными точками m12h_0h и 48h_72h",
+    "patients_tidy: организаций",
+    "HA_tidy: процедур",
+    "HA_tidy: пациентов"
+  ),
+  value = c(
+    nrow(patients_tidy),
+    n_distinct(patients_tidy$pat_record_id),
+    n_distinct(baseline_patients$pat_record_id),
+    source_pair_counts$n_with_both_points,
+    if ("organization" %in% names(patients_tidy)) n_distinct(na.omit(patients_tidy$organization)) else NA_integer_,
+    nrow(HA_tidy),
+    n_distinct(HA_tidy$pat_record_id)
+  )
+)
+
+dataset_overview
+```
+
+## Строки по временным точкам
+
+```{r}
+#| label: timepoint-counts
+
+patients_tidy %>%
+  group_by(timepoint) %>%
+  summarise(
+    n_rows = n(),
+    n_patients = n_distinct(pat_record_id),
+    .groups = "drop"
+  )
+```
+
+# 2. Структурные проверки
+
+## Дубли
+
+```{r}
+#| label: duplicate-checks
+
+patients_duplicates <- patients_tidy %>%
+  count(pat_record_id, timepoint, name = "n") %>%
+  filter(n > 1)
+
+ha_duplicates <- HA_tidy %>%
+  count(pat_record_id, HA_parameter, name = "n") %>%
+  filter(n > 1)
+
+tibble(
+  dataset = c("patients_tidy", "HA_tidy"),
+  n_duplicate_keys = c(
+    nrow(patients_duplicates),
+    nrow(ha_duplicates)
+  )
+)
+```
+
+## Наличие ключевых дат и временных интервалов
+
+```{r}
+#| label: key-datetime-completeness
+
+key_datetime_vars <- c(
+  "ICU_in_dt",
+  "ICU_out_or_death_dt",
+  "antibiotics_start_dt",
+  "first_sorption_dt",
+  "icu_to_HA1_hours",
+  "ICU_to_antibiotics_dt",
+  "antibiotics_to_HA1_hours"
+)
+
+patients_tidy %>%
+  distinct(pat_record_id, .keep_all = TRUE) %>%
+  select(any_of(c("pat_record_id", key_datetime_vars))) %>%
+  summarise(
+    across(
+      -pat_record_id,
+      list(
+        n_present = ~ sum(!is.na(.x)),
+        pct_missing = ~ mean(is.na(.x)) * 100
+      )
+    )
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to = c("variable", ".value"),
+    names_pattern = "^(.*)_(n_present|pct_missing)$"
+  ) %>%
+  arrange(desc(pct_missing))
+```
+
+# 3. Анализ пропусков
+
+## Пропуски основных baseline-переменных
+
+```{r}
+#| label: baseline-missingness-table
+
+baseline_missingness <- baseline_patients %>%
+  select(any_of(eda_numeric_vars)) %>%
+  summarise(
+    across(
+      everything(),
+      list(
+        n_observed = ~ sum(!is.na(.x)),
+        n_missing = ~ sum(is.na(.x)),
+        pct_missing = ~ mean(is.na(.x)) * 100
+      )
+    )
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to = c("variable", ".value"),
+    names_pattern = "^(.*)_(n_observed|n_missing|pct_missing)$"
+  ) %>%
+  arrange(desc(pct_missing), variable)
+
+baseline_missingness
+```
+
+## Пропуски по временным точкам
+
+```{r}
+#| label: dynamic-missingness-table
+
+missingness_by_timepoint <- patients_tidy %>%
+  select(pat_record_id, timepoint, any_of(eda_dynamic_vars)) %>%
+  pivot_longer(
+    cols = -c(pat_record_id, timepoint),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  group_by(timepoint, variable) %>%
+  summarise(
+    n_rows = n(),
+    n_observed = sum(!is.na(value)),
+    n_missing = sum(is.na(value)),
+    pct_missing = mean(is.na(value)) * 100,
+    .groups = "drop"
+  )
+
+missingness_by_timepoint
+```
+
+## График пропусков по временным точкам
+
+```{r}
+#| label: dynamic-missingness-heatmap
+#| fig-width: 10
+#| fig-height: 8
+
+missingness_by_timepoint %>%
+  ggplot(aes(x = timepoint, y = fct_rev(factor(variable)), fill = pct_missing)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.0f%%", pct_missing)), size = 3) +
+  scale_fill_gradient(
+    low = "white",
+    high = "grey30",
+    limits = c(0, 100),
+    name = "Missing"
+  ) +
+  labs(
+    x = "Timepoint",
+    y = NULL,
+    title = "Доля пропусков по временным точкам"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid = element_blank())
+```
+
+## Паттерн пропусков на baseline
+
+```{r}
+#| label: baseline-missingness-pattern
+#| fig-width: 11
+#| fig-height: 8
+
+baseline_missing_long <- baseline_patients %>%
+  select(pat_record_id, any_of(eda_numeric_vars)) %>%
+  pivot_longer(
+    cols = -pat_record_id,
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(is_missing = is.na(value))
+
+patient_missing_order <- baseline_missing_long %>%
+  group_by(pat_record_id) %>%
+  summarise(n_missing = sum(is_missing), .groups = "drop") %>%
+  arrange(desc(n_missing), pat_record_id) %>%
+  mutate(patient_order = row_number())
+
+baseline_missing_long %>%
+  left_join(patient_missing_order, by = "pat_record_id") %>%
+  ggplot(aes(x = patient_order, y = fct_rev(factor(variable)), fill = is_missing)) +
+  geom_tile() +
+  scale_fill_manual(
+    values = c(`FALSE` = "white", `TRUE` = "grey25"),
+    name = NULL,
+    labels = c(`FALSE` = "Есть значение", `TRUE` = "Пропуск")
+  ) +
+  labs(
+    x = "Пациенты, отсортированные по числу пропусков",
+    y = NULL,
+    title = "Паттерн пропусков основных baseline-переменных"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+# 4. Распределения числовых переменных
+
+## Описательные статистики
+
+```{r}
+#| label: numeric-summary
+
+numeric_summary <- baseline_patients %>%
+  select(any_of(eda_numeric_vars)) %>%
+  pivot_longer(
+    everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  group_by(variable) %>%
+  summarise(
+    n = sum(!is.na(value)),
+    missing_pct = mean(is.na(value)) * 100,
+    mean = mean(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    q1 = quantile(value, 0.25, na.rm = TRUE, names = FALSE),
+    q3 = quantile(value, 0.75, na.rm = TRUE, names = FALSE),
+    min = min(value, na.rm = TRUE),
+    max = max(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    across(
+      c(mean, sd, median, q1, q3, min, max, missing_pct),
+      ~ round(.x, 2)
+    )
+  )
+
+numeric_summary
+```
+
+## Гистограммы
+
+```{r}
+#| label: baseline-histograms
+#| fig-width: 13
+#| fig-height: 12
+
+baseline_patients %>%
+  select(any_of(eda_numeric_vars)) %>%
+  pivot_longer(
+    everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  filter(!is.na(value)) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, boundary = 0) +
+  facet_wrap(~ variable, scales = "free", ncol = 4) +
+  labs(
+    x = NULL,
+    y = "N",
+    title = "Распределения основных baseline-переменных"
+  ) +
+  theme_minimal(base_size = 10)
+```
+
+## Boxplots
+
+```{r}
+#| label: baseline-boxplots
+#| fig-width: 13
+#| fig-height: 12
+
+baseline_patients %>%
+  select(any_of(eda_numeric_vars)) %>%
+  pivot_longer(
+    everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  filter(!is.na(value)) %>%
+  ggplot(aes(x = "", y = value)) +
+  geom_boxplot(outlier.alpha = 0.5) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 4) +
+  labs(
+    x = NULL,
+    y = NULL,
+    title = "Boxplots основных baseline-переменных"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+```
+
+# 5. Потенциальные выбросы
+
+Здесь используется только стандартное диагностическое правило `1.5 × IQR`. Попадание значения в эту таблицу **не означает ошибку данных и не приводит к автоматическому удалению**.
+
+```{r}
+#| label: iqr-outlier-summary
+
+baseline_numeric_long <- baseline_patients %>%
+  select(pat_record_id, any_of(eda_numeric_vars)) %>%
+  pivot_longer(
+    cols = -pat_record_id,
+    names_to = "variable",
+    values_to = "value"
+  )
+
+outlier_limits <- baseline_numeric_long %>%
+  group_by(variable) %>%
+  summarise(
+    q1 = quantile(value, 0.25, na.rm = TRUE, names = FALSE),
+    q3 = quantile(value, 0.75, na.rm = TRUE, names = FALSE),
+    iqr = IQR(value, na.rm = TRUE),
+    lower = q1 - 1.5 * iqr,
+    upper = q3 + 1.5 * iqr,
+    .groups = "drop"
+  )
+
+outlier_summary <- baseline_numeric_long %>%
+  left_join(outlier_limits, by = "variable") %>%
+  mutate(
+    is_outlier = !is.na(value) & (value < lower | value > upper)
+  ) %>%
+  group_by(variable) %>%
+  summarise(
+    n_observed = sum(!is.na(value)),
+    n_iqr_outliers = sum(is_outlier),
+    pct_iqr_outliers = 100 * mean(is_outlier[!is.na(value)]),
+    lower_iqr_limit = first(lower),
+    upper_iqr_limit = first(upper),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(pct_iqr_outliers))
+
+outlier_summary
+```
+
+## Исходные значения потенциальных выбросов
+
+```{r}
+#| label: iqr-outlier-values
+
+baseline_numeric_long %>%
+  left_join(outlier_limits, by = "variable") %>%
+  filter(!is.na(value), value < lower | value > upper) %>%
+  arrange(variable, desc(value))
+```
+
+# 6. Категориальные переменные
+
+```{r}
+#| label: categorical-summary
+
+categorical_summary <- baseline_patients %>%
+  select(any_of(eda_categorical_vars)) %>%
+  mutate(across(everything(), as.character)) %>%
+  pivot_longer(
+    everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(value = replace_na(value, "<NA>")) %>%
+  count(variable, value, name = "n") %>%
+  group_by(variable) %>%
+  mutate(pct = 100 * n / sum(n)) %>%
+  ungroup() %>%
+  arrange(variable, desc(n))
+
+categorical_summary
+```
+
+```{r}
+#| label: categorical-plots
+#| fig-width: 12
+#| fig-height: 10
+
+categorical_summary %>%
+  mutate(value = fct_reorder(value, n)) %>%
+  ggplot(aes(x = n, y = value)) +
+  geom_col() +
+  facet_wrap(~ variable, scales = "free_y", ncol = 3) +
+  labs(
+    x = "N",
+    y = NULL,
+    title = "Распределение основных категориальных baseline-переменных"
+  ) +
+  theme_minimal(base_size = 10)
+```
+
+# 7. Базовая коррелограмма
+
+Корреляции здесь используются только как разведочная характеристика данных. Используется Spearman с `pairwise.complete.obs`; число доступных пар для каждой ячейки выводится отдельно. Углублённая работа со структурой корреляций будет выполняться в отдельном файле анализа структуры данных.
+
+## Подготовка матрицы
+
+```{r}
+#| label: basic-correlation-prep
+
+corr_data <- baseline_patients %>%
+  select(any_of(eda_numeric_vars)) %>%
+  select(
+    where(
+      ~ is.numeric(.x) &&
+        sum(!is.na(.x)) >= 3 &&
+        n_distinct(.x[!is.na(.x)]) >= 2
+    )
+  )
+
+corr_matrix <- cor(
+  corr_data,
+  use = "pairwise.complete.obs",
+  method = "spearman"
+)
+
+not_missing <- !is.na(as.matrix(corr_data))
+pairwise_n <- t(not_missing) %*% not_missing
+
+corr_order <- colnames(corr_matrix)
+```
+
+## Коррелограмма
+
+```{r}
+#| label: basic-correlation-plot
+#| fig-width: 11
+#| fig-height: 10
+
+corr_long <- as.data.frame(corr_matrix, check.names = FALSE) %>%
+  rownames_to_column("var_y") %>%
+  pivot_longer(
+    -var_y,
+    names_to = "var_x",
+    values_to = "rho"
+  ) %>%
+  mutate(
+    x_id = match(var_x, corr_order),
+    y_id = match(var_y, corr_order)
+  ) %>%
+  filter(y_id >= x_id) %>%
+  mutate(
+    var_x = factor(var_x, levels = corr_order),
+    var_y = factor(var_y, levels = rev(corr_order))
+  )
+
+corr_long %>%
+  ggplot(aes(x = var_x, y = var_y, fill = rho)) +
+  geom_tile() +
+  geom_text(
+    aes(label = if_else(abs(rho) >= 0.30, sprintf("%.2f", rho), "")),
+    size = 2.6
+  ) +
+  scale_fill_gradient2(
+    low = "grey20",
+    mid = "white",
+    high = "grey70",
+    midpoint = 0,
+    limits = c(-1, 1),
+    name = "Spearman\nρ"
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    title = "Базовая коррелограмма исходных числовых показателей",
+    subtitle = "Подписаны |ρ| ≥ 0.30"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 60, hjust = 1)
+  )
+```
+
+## Число наблюдений в попарных корреляциях
+
+```{r}
+#| label: basic-correlation-pairwise-n
+
+as.data.frame(pairwise_n, check.names = FALSE) %>%
+  rownames_to_column("variable")
+```
+
+# 8. Полнота исходных точек для парного анализа
+
+Этот раздел не анализирует динамику; он проверяет наличие исходных реестровых точек `m12h_0h` и `48h_72h`.
+
+```{r}
+#| label: source-timepoint-pair-completeness
+
+source_timepoint_presence <- patients_tidy %>%
+  filter(timepoint %in% c("m12h_0h", "48h_72h")) %>%
+  distinct(pat_record_id, timepoint) %>%
+  mutate(present = TRUE) %>%
+  pivot_wider(
+    names_from = timepoint,
+    values_from = present,
+    values_fill = FALSE
+  )
+
+source_timepoint_completeness <- patients_tidy %>%
+  distinct(pat_record_id) %>%
+  left_join(source_timepoint_presence, by = "pat_record_id") %>%
+  mutate(
+    m12h_0h = coalesce(m12h_0h, FALSE),
+    `48h_72h` = coalesce(`48h_72h`, FALSE)
+  ) %>%
+  mutate(
+    pair_status = case_when(
+      m12h_0h & `48h_72h` ~ "Обе точки",
+      m12h_0h & !`48h_72h` ~ "Только baseline",
+      !m12h_0h & `48h_72h` ~ "Только follow-up",
+      TRUE ~ "Нет точек"
+    )
+  ) %>%
+  count(pair_status, name = "n_patients") %>%
+  mutate(pct = 100 * n_patients / sum(n_patients))
+
+source_timepoint_completeness
+```

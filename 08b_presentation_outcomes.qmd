@@ -1,0 +1,737 @@
+---
+title: "2Reg — 08b presentation outcomes"
+format:
+  html:
+    toc: true
+    number-sections: true
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: false
+---
+
+# Входные данные и предварительные условия
+
+Этот файл относится к блоку подготовки презентации.
+
+Необходимые входные данные считываются только из RDS-файлов:
+
+data/patients_tidy.rds — итоговый RDS-файл ETL с исходными временными точками регистра;
+data/HA_tidy.rds — итоговый RDS-файл ETL, используемый только для сравнения ранней и поздней первой сорбции.
+
+Объекты из глобального окружения R и ETL-скриптов повторно не используются.
+
+# Setup
+
+```{r}
+#| label: setup
+#| include: false
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(tibble)
+  library(gtsummary)
+  library(flextable)
+  library(lubridate)
+})
+
+source("R/analysis_helpers.R")
+
+DATA_DIR <- "data"
+ANALYSIS_DATA_DIR <- file.path(DATA_DIR, "analysis")
+TABLES_DIR <- "tables"
+dir.create(TABLES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# Единая компоновка таблиц исходов для PowerPoint. Явно резервируем
+# отдельную ширину для каждой группы, чтобы соседние значения не слипались.
+style_outcomes_pptx <- function(ft, max_width = 8.9) {
+  ft <- flextable::autofit(ft)
+  keys <- ft$col_keys
+  stat_keys <- grep("^stat_", keys, value = TRUE)
+
+  if ("label" %in% keys && length(stat_keys) > 0L) {
+    label_width <- if (length(stat_keys) >= 3L) 3.4 else 4.1
+    stat_width <- (max_width - label_width) / length(stat_keys)
+
+    ft <- ft %>%
+      flextable::width(j = "label", width = label_width) %>%
+      flextable::width(j = stat_keys, width = stat_width) %>%
+      flextable::align(j = stat_keys, align = "center", part = "all") %>%
+      flextable::padding(j = stat_keys, padding.left = 6, padding.right = 6, part = "all")
+  }
+
+  flextable::fit_to_width(ft, max_width = max_width)
+}
+
+patients_rds <- pick_path(c(
+  file.path(DATA_DIR, "patients_tidy.rds"),
+  file.path("/mnt/data", DATA_DIR, "patients_tidy.rds"),
+  "patients_tidy.rds"
+))
+
+ha_rds <- pick_path(c(
+  file.path(DATA_DIR, "HA_tidy.rds"),
+  file.path("/mnt/data", DATA_DIR, "HA_tidy.rds"),
+  "HA_tidy.rds"
+))
+
+patients_tidy <- readRDS(patients_rds)
+HA_tidy <- readRDS(ha_rds)
+
+source_timepoints <- c("m12h_0h", "48h_72h")
+patients_analysis <- patients_tidy %>%
+  filter(timepoint %in% source_timepoints) %>%
+  distinct(pat_record_id, timepoint, .keep_all = TRUE)
+
+assert_columns(
+  patients_analysis,
+  c(
+    "pat_record_id", "timepoint", "outcome", "ICU_in_dt",
+    "ICU_out_or_death_dt", "SOFA", "VIS2020_0_excl",
+    "HA_efficency_CGI_E", "outcome_28d_status", "outcome_death_28d_bin"
+  ),
+  "patients_analysis"
+)
+```
+
+# Slide 4. Outcomes
+
+## Слайд 4. Исходы
+
+```{r}
+
+#| label: pptx_slide4
+#| include: true
+
+# Здесь собираем таблицу исходов по исходным точкам регистра.
+
+sofa_col <- "SOFA"
+vis_col  <- "VIS2020_0_excl"
+cgi_col  <- "HA_efficency_CGI_E"
+
+tp0 <- "m12h_0h"
+tp1 <- "48h_72h"
+
+# --- 1 строка на пациента ---
+# Берем исходные строки m12h_0h и 48h_72h без переназначения таймпойнтов.
+out_df <- patients_analysis %>%
+  group_by(pat_record_id) %>%
+  summarise(
+    first_sorption_type = first_non_na(first_sorption_type),
+    outcome = first_non_na(outcome),
+    outcome_death_28d_bin = first_non_na(outcome_death_28d_bin),
+    ICU_in_dt = first_non_na(ICU_in_dt),
+    ICU_out_or_death_dt = first_non_na(ICU_out_or_death_dt),
+    CGI_E_raw = first_non_na(.data[[cgi_col]]),
+
+    SOFA_m12 = first_non_na(.data[[sofa_col]][timepoint == tp0]),
+    SOFA_48_72 = first_non_na(.data[[sofa_col]][timepoint == tp1]),
+
+    VIS_m12 = first_non_na(.data[[vis_col]][timepoint == tp0]),
+    VIS_48_72 = first_non_na(.data[[vis_col]][timepoint == tp1]),
+
+    .groups = "drop"
+  )
+
+# --- derived outcomes ---
+out_df <- out_df %>%
+  mutate(
+    outcome_norm = norm_txt(outcome),
+
+    # Время до выписки из ОРИТ: только для outcome == "Выписан из ОРИТ"
+    time_to_icu_discharge_h = dplyr::if_else(
+      outcome_norm == "Выписан из ОРИТ" & !is.na(ICU_in_dt) & !is.na(ICU_out_or_death_dt),
+      as.numeric(difftime(ICU_out_or_death_dt, ICU_in_dt, units = "hours")),
+      NA_real_
+    ),
+
+    # CGI-E: 2 уровня
+    CGI_E_2lvl = {
+      x <- norm_txt(CGI_E_raw)
+      dplyr::case_when(
+        x %in% c(
+          "Без изменений или хуже",
+          "Минимальное улучшение. Незначительное улучшение, не влияющее на клинический статус пациента"
+        ) ~ "Нет улучшений",
+        x %in% c(
+          "Отмечено значительное улучшение. Полная или почти полная ремиссия симптомов",
+          "Умеренное улучшение. Частичная ремиссия симптомов"
+        ) ~ "Есть улучшения",
+        TRUE ~ NA_character_
+      ) %>%
+        factor(levels = c("Есть улучшения", "Нет улучшений"))
+    },
+
+    SOFA_drop_2plus = dplyr::case_when(
+      !is.na(SOFA_m12) & !is.na(SOFA_48_72) ~ (SOFA_m12 - SOFA_48_72 >= 2),
+      TRUE ~ NA
+    ) %>% factor(levels = c(TRUE, FALSE), labels = c("Да", "Нет")),
+
+    VIS_drop_20plus = dplyr::case_when(
+      !is.na(VIS_m12) & !is.na(VIS_48_72) ~ (VIS_m12 - VIS_48_72 >= 20),
+      TRUE ~ NA
+    ) %>% factor(levels = c(TRUE, FALSE), labels = c("Да", "Нет")),
+
+    mortality = dplyr::case_when(
+      outcome_death_28d_bin == 1L ~ "Умер",
+      outcome_death_28d_bin == 0L ~ "Жив",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("Умер", "Жив"))
+  )
+
+tbl4 <- out_df %>%
+select(first_sorption_type, time_to_icu_discharge_h, CGI_E_2lvl, SOFA_drop_2plus, VIS_drop_20plus, mortality) %>%
+tbl_summary(
+  by = first_sorption_type,
+  type = list(
+    CGI_E_2lvl ~ "dichotomous",
+    SOFA_drop_2plus ~ "dichotomous",
+    VIS_drop_20plus ~ "dichotomous",
+    mortality ~ "dichotomous"
+  ),
+  value = list(
+    CGI_E_2lvl ~ "Есть улучшения",
+    SOFA_drop_2plus ~ "Да",
+    VIS_drop_20plus ~ "Да",
+    mortality ~ "Умер"
+  ),
+  statistic = list(
+    time_to_icu_discharge_h ~ "{median} ({p25}, {p75})",
+    all_categorical() ~ "{n} ({p}%)"
+  ),
+  label = list(
+    time_to_icu_discharge_h = "Время до выписки из ОРИТ, ч",
+    CGI_E_2lvl = "CGI-E: есть улучшения",
+    SOFA_drop_2plus = "Снижение SOFA ≥ 2 за 72 ч",
+    VIS_drop_20plus = "Снижение VIS2020 ≥ 20 за 72 ч (исходное VIS > 0)",
+    mortality = "28-дневная летальность (% среди известных исходов)"
+  ),
+  missing = "no"
+) %>%
+  modify_header(all_stat_cols() ~ "**{level}**, N = {n}") %>%
+  bold_labels()
+
+flx4 <- gtsummary::as_flex_table(tbl4) %>%
+  style_outcomes_pptx()
+
+invisible(flextable::save_as_pptx(flx4, path = file.path(TABLES_DIR, "table4_outcomes.pptx")))
+flx4
+```
+
+### Исходы по переводам из ОРИТ
+
+```{r}
+#| label: pptx_slide4_transfer
+#| cache: true
+#| warning: false
+#| message: false
+
+tp0 <- "m12h_0h"
+tp1 <- "48h_72h"
+
+out_df_transfer <- patients_analysis %>%
+  group_by(pat_record_id) %>%
+  summarise(
+    from_other_ICU_transfer = first_non_na(from_other_ICU_transfer),
+    outcome_raw = first_non_na(outcome),
+    outcome_death_28d_bin = first_non_na(outcome_death_28d_bin),
+    CGI_E_raw   = first_non_na(.data[[cgi_col]]),
+
+    ICU_in_dt = first_non_na(ICU_in_dt),
+    ICU_out_or_death_dt = first_non_na(ICU_out_or_death_dt),
+
+    SOFA_m12   = first_non_na(SOFA[timepoint == tp0]),
+    SOFA_48_72 = first_non_na(SOFA[timepoint == tp1]),
+
+    VIS_m12    = first_non_na(.data[[vis_col]][timepoint == tp0]),
+    VIS_48_72  = first_non_na(.data[[vis_col]][timepoint == tp1]),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    outcome_norm = norm_txt(outcome_raw),
+
+    time_to_icu_discharge_h = dplyr::case_when(
+      outcome_norm == "Выписан из ОРИТ" & !is.na(ICU_in_dt) & !is.na(ICU_out_or_death_dt) ~
+        as.numeric(difftime(ICU_out_or_death_dt, ICU_in_dt, units = "hours")),
+      TRUE ~ NA_real_
+    ),
+
+    CGI_E_2lvl = {
+      x <- norm_txt(CGI_E_raw)
+      dplyr::case_when(
+        x %in% c(
+          "Без изменений или хуже",
+          "Минимальное улучшение. Незначительное улучшение, не влияющее на клинический статус пациента"
+        ) ~ "Нет улучшений",
+        x %in% c(
+          "Отмечено значительное улучшение. Полная или почти полная ремиссия симптомов",
+          "Умеренное улучшение. Частичная ремиссия симптомов"
+        ) ~ "Есть улучшения",
+        TRUE ~ NA_character_
+      ) %>%
+        factor(levels = c("Есть улучшения", "Нет улучшений"))
+    },
+
+    SOFA_drop_2plus = dplyr::case_when(
+      !is.na(SOFA_m12) & !is.na(SOFA_48_72) ~ (SOFA_m12 - SOFA_48_72 >= 2),
+      TRUE ~ NA
+    ) %>% factor(levels = c(TRUE, FALSE), labels = c("Да", "Нет")),
+
+    VIS_drop_20plus = dplyr::case_when(
+      !is.na(VIS_m12) & !is.na(VIS_48_72) ~ (VIS_m12 - VIS_48_72 >= 20),
+      TRUE ~ NA
+    ) %>% factor(levels = c(TRUE, FALSE), labels = c("Да", "Нет")),
+
+    mortality = dplyr::case_when(
+      outcome_death_28d_bin == 1L ~ "Умер",
+      outcome_death_28d_bin == 0L ~ "Жив",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("Умер", "Жив"))
+  )
+
+make_outcome_tbl <- function(df) {
+  df %>%
+    select(
+      time_to_icu_discharge_h,
+      CGI_E_2lvl,
+      SOFA_drop_2plus,
+      VIS_drop_20plus,
+      mortality
+    ) %>%
+    tbl_summary(
+      type = list(
+        CGI_E_2lvl ~ "dichotomous",
+        SOFA_drop_2plus ~ "dichotomous",
+        VIS_drop_20plus ~ "dichotomous",
+        mortality ~ "dichotomous"
+      ),
+      value = list(
+        CGI_E_2lvl ~ "Есть улучшения",
+        SOFA_drop_2plus ~ "Да",
+        VIS_drop_20plus ~ "Да",
+        mortality ~ "Умер"
+      ),
+      statistic = list(
+        time_to_icu_discharge_h ~ "{median} ({p25}, {p75})",
+        all_categorical() ~ "{n} ({p}%)"
+      ),
+      label = list(
+        time_to_icu_discharge_h = "Время до выписки из ОРИТ, ч",
+        CGI_E_2lvl = "CGI-E: есть улучшения",
+        SOFA_drop_2plus = "Снижение SOFA ≥ 2 за 72 ч",
+        VIS_drop_20plus = "Снижение VIS2020 ≥ 20 за 72 ч (исходное VIS > 0)",
+        mortality = "28-дневная летальность (% среди известных исходов)"
+      ),
+      missing = "no"
+    ) %>%
+    bold_labels()
+}
+
+tbl4_all <- out_df_transfer %>%
+  make_outcome_tbl()
+
+tbl4_no_transfer <- out_df_transfer %>%
+  filter(from_other_ICU_transfer != "Да" | is.na(from_other_ICU_transfer)) %>%
+  make_outcome_tbl()
+
+tbl4_transfer_compare <- tbl_merge(
+  tbls = list(tbl4_all, tbl4_no_transfer),
+  tab_spanner = c(
+    paste0("**Все пациенты**, N = ", nrow(out_df_transfer)),
+    paste0(
+      "**Без перевода из другого ОРИТ**, N = ",
+      out_df_transfer %>%
+        filter(from_other_ICU_transfer != "Да" | is.na(from_other_ICU_transfer)) %>%
+        nrow()
+    )
+  )
+)
+
+flx4_transfer_compare <- gtsummary::as_flex_table(tbl4_transfer_compare) %>%
+  style_outcomes_pptx()
+
+invisible(
+  flextable::save_as_pptx(
+    flx4_transfer_compare,
+    path = file.path(TABLES_DIR, "table4_outcomes_all_vs_no_transfer.pptx")
+  )
+)
+
+flx4_transfer_compare
+```
+
+### Исходы по МНО на T0
+
+```{r}
+#| label: pptx_slide4_inr_t0
+#| cache: true
+#| warning: false
+#| message: false
+
+# Аналог pptx_slide4_transfer, но пациенты делятся по МНО на T0:
+# МНО < 1.4 vs МНО >= 1.4.
+# T0 в текущем пайплайне кодируется как m12h_0h.
+
+if (!"INR" %in% names(patients_analysis)) {
+  stop("В patients_tidy нет столбца INR. Сначала выполните актуальный ETL.")
+}
+
+tp0 <- "m12h_0h"
+tp1 <- "48h_72h"
+
+out_df_inr_t0 <- patients_analysis %>%
+  group_by(pat_record_id) %>%
+  summarise(
+    INR_m12 = suppressWarnings(as.numeric(first_non_na(INR[timepoint == tp0]))),
+    outcome_raw = first_non_na(outcome),
+    outcome_death_28d_bin = first_non_na(outcome_death_28d_bin),
+    CGI_E_raw   = first_non_na(.data[[cgi_col]]),
+
+    ICU_in_dt = first_non_na(ICU_in_dt),
+    ICU_out_or_death_dt = first_non_na(ICU_out_or_death_dt),
+
+    SOFA_m12   = first_non_na(.data[[sofa_col]][timepoint == tp0]),
+    SOFA_48_72 = first_non_na(.data[[sofa_col]][timepoint == tp1]),
+
+    VIS_m12    = first_non_na(.data[[vis_col]][timepoint == tp0]),
+    VIS_48_72  = first_non_na(.data[[vis_col]][timepoint == tp1]),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    INR_group = dplyr::case_when(
+      !is.na(INR_m12) & INR_m12 < 1.4  ~ "МНО < 1.4",
+      !is.na(INR_m12) & INR_m12 >= 1.4 ~ "МНО ≥ 1.4",
+      TRUE ~ NA_character_
+    ) %>%
+      factor(levels = c("МНО < 1.4", "МНО ≥ 1.4")),
+
+    outcome_norm = norm_txt(outcome_raw),
+
+    time_to_icu_discharge_h = dplyr::case_when(
+      outcome_norm == "Выписан из ОРИТ" & !is.na(ICU_in_dt) & !is.na(ICU_out_or_death_dt) ~
+        as.numeric(difftime(ICU_out_or_death_dt, ICU_in_dt, units = "hours")),
+      TRUE ~ NA_real_
+    ),
+
+    CGI_E_2lvl = {
+      x <- norm_txt(CGI_E_raw)
+      dplyr::case_when(
+        x %in% c(
+          "Без изменений или хуже",
+          "Минимальное улучшение. Незначительное улучшение, не влияющее на клинический статус пациента"
+        ) ~ "Нет улучшений",
+        x %in% c(
+          "Отмечено значительное улучшение. Полная или почти полная ремиссия симптомов",
+          "Умеренное улучшение. Частичная ремиссия симптомов"
+        ) ~ "Есть улучшения",
+        TRUE ~ NA_character_
+      ) %>%
+        factor(levels = c("Есть улучшения", "Нет улучшений"))
+    },
+
+    SOFA_drop_2plus = dplyr::case_when(
+      !is.na(SOFA_m12) & !is.na(SOFA_48_72) ~ (SOFA_m12 - SOFA_48_72 >= 2),
+      TRUE ~ NA
+    ) %>% factor(levels = c(TRUE, FALSE), labels = c("Да", "Нет")),
+
+    VIS_drop_20plus = dplyr::case_when(
+      !is.na(VIS_m12) & !is.na(VIS_48_72) ~ (VIS_m12 - VIS_48_72 >= 20),
+      TRUE ~ NA
+    ) %>% factor(levels = c(TRUE, FALSE), labels = c("Да", "Нет")),
+
+    mortality = dplyr::case_when(
+      outcome_death_28d_bin == 1L ~ "Умер",
+      outcome_death_28d_bin == 0L ~ "Жив",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("Умер", "Жив"))
+  ) %>%
+  filter(!is.na(INR_group))
+
+tbl4_inr_t0 <- out_df_inr_t0 %>%
+  select(
+    INR_group,
+    time_to_icu_discharge_h,
+    CGI_E_2lvl,
+    SOFA_drop_2plus,
+    VIS_drop_20plus,
+    mortality
+  ) %>%
+  tbl_summary(
+    by = INR_group,
+    type = list(
+      CGI_E_2lvl ~ "dichotomous",
+      SOFA_drop_2plus ~ "dichotomous",
+      VIS_drop_20plus ~ "dichotomous",
+      mortality ~ "dichotomous"
+    ),
+    value = list(
+      CGI_E_2lvl ~ "Есть улучшения",
+      SOFA_drop_2plus ~ "Да",
+      VIS_drop_20plus ~ "Да",
+      mortality ~ "Умер"
+    ),
+    statistic = list(
+      time_to_icu_discharge_h ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{p}% ({n})"
+    ),
+    label = list(
+      time_to_icu_discharge_h = "Время до выписки из ОРИТ, ч",
+      CGI_E_2lvl = "CGI-E: есть улучшения",
+      SOFA_drop_2plus = "Снижение SOFA ≥ 2 за 72 ч",
+      VIS_drop_20plus = "Снижение VIS2020 ≥ 20 за 72 ч (исходное VIS > 0)",
+      mortality = "28-дневная летальность (% среди известных исходов)"
+    ),
+    missing = "no"
+  ) %>%
+  modify_header(all_stat_cols() ~ "**{level}**, N = {n}") %>%
+  modify_caption("**Исходы в зависимости от МНО на T0**") %>%
+  bold_labels()
+
+flx4_inr_t0 <- gtsummary::as_flex_table(tbl4_inr_t0) %>%
+  style_outcomes_pptx()
+
+invisible(
+  flextable::save_as_pptx(
+    flx4_inr_t0,
+    path = file.path(TABLES_DIR, "table4_outcomes_by_INR_T0.pptx")
+  )
+)
+
+flx4_inr_t0
+```
+
+### Исходы: ранняя vs поздняя первая гемосорбция
+
+```{r}
+#| label: pptx_slide4_early_late_sorption
+#| cache: true
+#| warning: false
+#| message: false
+
+# Аналог Слайда 4, но вместо сравнения "все пациенты / без перевода из другого ОРИТ"
+# делим пациентов по времени начала первой гемосорбции:
+# ранняя = HA_start_dt <= ICU_in_dt + 24 часа,
+# поздняя = HA_start_dt > ICU_in_dt + 24 часа.
+# Берем только первую процедуру с HA_parameter == "Гемоперфузия 1".
+
+# Отключаемый фильтр: TRUE = только LPS, FALSE = все типы картриджей.
+pptx_slide4_early_late_lps_only <- TRUE
+
+tp0 <- "m12h_0h"
+tp1 <- "48h_72h"
+
+# --- 1 строка на пациента: исходы и динамика по исходным таймпойнтам ---
+out_df_early_late <- patients_analysis %>%
+  group_by(pat_record_id) %>%
+  summarise(
+    outcome_raw = first_non_na(outcome),
+    outcome_death_28d_bin = first_non_na(outcome_death_28d_bin),
+    CGI_E_raw   = first_non_na(.data[[cgi_col]]),
+
+    ICU_in_dt = first_non_na(ICU_in_dt),
+    ICU_out_or_death_dt = first_non_na(ICU_out_or_death_dt),
+
+    SOFA_m12   = first_non_na(SOFA[timepoint == tp0]),
+    SOFA_48_72 = first_non_na(SOFA[timepoint == tp1]),
+
+    VIS_m12    = first_non_na(.data[[vis_col]][timepoint == tp0]),
+    VIS_48_72  = first_non_na(.data[[vis_col]][timepoint == tp1]),
+    .groups = "drop"
+  )
+
+# --- Время первой гемосорбции ---
+ha_first_sorption_src <- HA_tidy %>%
+  filter(HA_parameter == "Гемоперфузия 1")
+
+if (pptx_slide4_early_late_lps_only) {
+  if (!"HA_cartrige_type_std" %in% names(ha_first_sorption_src)) {
+    stop("В HA_tidy нет колонки HA_cartrige_type_std для LPS-фильтра.")
+  }
+
+  ha_first_sorption_src <- ha_first_sorption_src %>%
+    filter(HA_cartrige_type_std == "LPS")
+}
+
+ha_first_sorption_timing <- ha_first_sorption_src %>%
+  filter(!is.na(HA_start_dt)) %>%
+  arrange(pat_record_id, HA_start_dt) %>%
+  group_by(pat_record_id) %>%
+  summarise(
+    HA_start_dt = first_non_na(HA_start_dt),
+    HA_cartrige_type_std = first_non_na(HA_cartrige_type_std),
+    .groups = "drop"
+  )
+
+# --- derived outcomes + группа ранняя/поздняя ---
+out_df_early_late <- out_df_early_late %>%
+  inner_join(ha_first_sorption_timing, by = "pat_record_id") %>%
+  filter(!is.na(ICU_in_dt), !is.na(HA_start_dt)) %>%
+  mutate(
+    HA_start_timing = dplyr::case_when(
+      HA_start_dt <= ICU_in_dt + lubridate::hours(24) ~ "Ранняя (≤24 ч)",
+      HA_start_dt >  ICU_in_dt + lubridate::hours(24) ~ "Поздняя (>24 ч)",
+      TRUE ~ NA_character_
+    ) %>%
+      factor(levels = c("Ранняя (≤24 ч)", "Поздняя (>24 ч)")),
+
+    outcome_norm = norm_txt(outcome_raw),
+
+    time_to_icu_discharge_h = dplyr::case_when(
+      outcome_norm == "Выписан из ОРИТ" & !is.na(ICU_in_dt) & !is.na(ICU_out_or_death_dt) ~
+        as.numeric(difftime(ICU_out_or_death_dt, ICU_in_dt, units = "hours")),
+      TRUE ~ NA_real_
+    ),
+
+    CGI_E_2lvl = {
+      x <- norm_txt(CGI_E_raw)
+      dplyr::case_when(
+        x %in% c(
+          "Без изменений или хуже",
+          "Минимальное улучшение. Незначительное улучшение, не влияющее на клинический статус пациента"
+        ) ~ "Нет улучшений",
+        x %in% c(
+          "Отмечено значительное улучшение. Полная или почти полная ремиссия симптомов",
+          "Умеренное улучшение. Частичная ремиссия симптомов"
+        ) ~ "Есть улучшения",
+        TRUE ~ NA_character_
+      ) %>%
+        factor(levels = c("Есть улучшения", "Нет улучшений"))
+    },
+
+    SOFA_drop_2plus = dplyr::case_when(
+      !is.na(SOFA_m12) & !is.na(SOFA_48_72) ~ (SOFA_m12 - SOFA_48_72 >= 2),
+      TRUE ~ NA
+    ) %>% factor(levels = c(TRUE, FALSE), labels = c("Да", "Нет")),
+
+    VIS_drop_20plus = dplyr::case_when(
+      !is.na(VIS_m12) & !is.na(VIS_48_72) ~ (VIS_m12 - VIS_48_72 >= 20),
+      TRUE ~ NA
+    ) %>% factor(levels = c(TRUE, FALSE), labels = c("Да", "Нет")),
+
+    mortality = dplyr::case_when(
+      outcome_death_28d_bin == 1L ~ "Умер",
+      outcome_death_28d_bin == 0L ~ "Жив",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("Умер", "Жив"))
+  ) %>%
+  filter(!is.na(HA_start_timing))
+
+caption_slide4_early_late <- paste0(
+  "**Исходы в зависимости от ранней/поздней первой гемосорбции",
+  if (pptx_slide4_early_late_lps_only) " (только LPS)" else "",
+  "**"
+)
+
+tbl4_early_late <- out_df_early_late %>%
+  select(
+    HA_start_timing,
+    time_to_icu_discharge_h,
+    CGI_E_2lvl,
+    SOFA_drop_2plus,
+    VIS_drop_20plus,
+    mortality
+  ) %>%
+  tbl_summary(
+    by = HA_start_timing,
+    type = list(
+      CGI_E_2lvl ~ "dichotomous",
+      SOFA_drop_2plus ~ "dichotomous",
+      VIS_drop_20plus ~ "dichotomous",
+      mortality ~ "dichotomous"
+    ),
+    value = list(
+      CGI_E_2lvl ~ "Есть улучшения",
+      SOFA_drop_2plus ~ "Да",
+      VIS_drop_20plus ~ "Да",
+      mortality ~ "Умер"
+    ),
+    statistic = list(
+      time_to_icu_discharge_h ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      time_to_icu_discharge_h = "Время до выписки из ОРИТ, ч",
+      CGI_E_2lvl = "CGI-E: есть улучшения",
+      SOFA_drop_2plus = "Снижение SOFA ≥ 2 за 72 ч",
+      VIS_drop_20plus = "Снижение VIS2020 ≥ 20 за 72 ч (исходное VIS > 0)",
+      mortality = "28-дневная летальность (% среди известных исходов)"
+    ),
+    missing = "no"
+  ) %>%
+  modify_header(all_stat_cols() ~ "**{level}**, N = {n}") %>%
+  modify_caption(caption_slide4_early_late) %>%
+  bold_labels()
+
+flx4_early_late <- gtsummary::as_flex_table(tbl4_early_late) %>%
+  style_outcomes_pptx()
+
+invisible(
+  flextable::save_as_pptx(
+    flx4_early_late,
+    path = file.path(
+      TABLES_DIR,
+      if (pptx_slide4_early_late_lps_only) {
+        "table4_outcomes_early_vs_late_sorption_LPS.pptx"
+      } else {
+        "table4_outcomes_early_vs_late_sorption_all_devices.pptx"
+      }
+    )
+  )
+)
+
+flx4_early_late
+```
+
+### Пациенты/SOFA/VIS pair
+
+```{r}
+#| label: qc_pptx_slide4_counts
+#| cache: false
+#| echo: false
+
+tp0 <- "m12h_0h"
+tp1 <- "48h_72h"
+
+# 1) Сколько строк и пациентов в исходных таймпойнтах
+qc_rows <- patients_analysis %>%
+  summarise(
+    n_rows = n(),
+    n_patients = n_distinct(pat_record_id)
+  )
+
+qc_pair_status <- patients_analysis %>%
+  distinct(pat_record_id, timepoint) %>%
+  count(pat_record_id, name = "n_timepoints") %>%
+  count(n_timepoints, name = "n_patients")
+
+# 2) Сколько пациентов попадает в out_df по группам
+qc_out_df <- patients_analysis %>%
+  group_by(pat_record_id) %>%
+  summarise(
+    first_sorption_type = first_non_na(first_sorption_type),
+    SOFA_m12 = first_non_na(SOFA[timepoint == tp0]),
+    SOFA_48_72 = first_non_na(SOFA[timepoint == tp1]),
+    VIS_m12 = first_non_na(VIS2020_0_excl[timepoint == tp0]),
+    VIS_48_72 = first_non_na(VIS2020_0_excl[timepoint == tp1]),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    has_SOFA_pair = !is.na(SOFA_m12) & !is.na(SOFA_48_72),
+    has_VIS_pair  = !is.na(VIS_m12) & !is.na(VIS_48_72)
+  ) %>%
+  group_by(first_sorption_type) %>%
+  summarise(
+    n_patients_total = n(),
+    n_with_SOFA_pair = sum(has_SOFA_pair, na.rm = TRUE),
+    n_with_VIS_pair  = sum(has_VIS_pair, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+qc_rows
+qc_pair_status
+qc_out_df
+```

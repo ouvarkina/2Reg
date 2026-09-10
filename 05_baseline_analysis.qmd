@@ -1,0 +1,1485 @@
+---
+title: "2Reg — baseline analysis: descriptive tables and correlations"
+format:
+  html:
+    toc: true
+    number-sections: true
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: false
+---
+
+# Входные данные и предварительные условия
+
+Этот файл выполняет этап анализа исходных данных. В одном автономном QMD-файле объединены описательные таблицы, расчёты корреляций, частичные корреляции с поправкой на SOFA и таблицы подгрупп для T0.
+
+Необходимые входные данные:
+
+data/patients_tidy.rds;
+data/HA_tidy.rds;
+data/analysis/baseline_severity_by_patient.rds, создаваемый скриптом 03b_severity_and_numeric_outcome.qmd;
+data/analysis/outcome_propensity_by_patient.rds, создаваемый скриптом 03b_severity_and_numeric_outcome.qmd.
+
+Google-таблица Dictionary используется только для отображения подписей.
+
+# Setup
+
+```{r}
+#| label: setup
+#| include: false
+#| cache: false
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(tibble)
+  library(purrr)
+  library(lubridate)
+  library(ggplot2)
+  library(corrplot)
+  library(gtsummary)
+  library(flextable)
+  library(officer)
+  library(rlang)
+  library(googlesheets4)
+})
+
+source("R/analysis_helpers.R")
+source("R/correlation_helpers.R")
+
+DATA_DIR <- "data"
+ANALYSIS_DATA_DIR <- file.path(DATA_DIR, "analysis")
+TABLES_DIR <- "tables"
+GRAPHES_DIR <- "graphes"
+
+dir.create(ANALYSIS_DATA_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(TABLES_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(GRAPHES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+patients_rds <- pick_path(c(
+  file.path(DATA_DIR, "patients_tidy.rds"),
+  file.path("/mnt/data", DATA_DIR, "patients_tidy.rds"),
+  "patients_tidy.rds"
+))
+
+ha_rds <- pick_path(c(
+  file.path(DATA_DIR, "HA_tidy.rds"),
+  file.path("/mnt/data", DATA_DIR, "HA_tidy.rds"),
+  "HA_tidy.rds"
+))
+
+severity_rds <- pick_path(c(
+  file.path(ANALYSIS_DATA_DIR, "baseline_severity_by_patient.rds"),
+  file.path("/mnt/data", ANALYSIS_DATA_DIR, "baseline_severity_by_patient.rds"),
+  "baseline_severity_by_patient.rds"
+))
+
+outcome_propensity_rds <- pick_path(c(
+  file.path(ANALYSIS_DATA_DIR, "outcome_propensity_by_patient.rds"),
+  file.path("/mnt/data", ANALYSIS_DATA_DIR, "outcome_propensity_by_patient.rds"),
+  "outcome_propensity_by_patient.rds"
+))
+
+patients_tidy <- readRDS(patients_rds)
+HA_tidy <- readRDS(ha_rds)
+
+assert_columns(
+  patients_tidy,
+  c(
+    "outcome_days", "outcome_dead_bin", "sex_male_bin",
+    "vasopressors_if_used_bin", "RRT_if_used_bin", "MV_if_used_bin",
+    "ECMO_if_used_bin", "from_other_ICU_transfer_bin",
+    "ICU_6_month_history_bin", "RRT_required_baseline",
+    "MV_required_baseline", "CT_count", "LPS_count", "devices_total",
+    "is_pat_gram_plus", "is_pat_gram_minus", "is_bacteremic",
+    "is_pat_fungal", "antibiotics_started_bin"
+  ),
+  "patients_tidy"
+)
+
+assert_columns(
+  HA_tidy,
+  c(
+    "HA_anticoagulation_cat", "HA_anticoag_heparin",
+    "HA_cartridge_LPS_bin", "HA_with_RRT_bin",
+    "HA_other_methods_bin", "HA_adverse_effects_bin",
+    "HA_adverse_effects_recorded_bin"
+  ),
+  "HA_tidy"
+)
+
+baseline_severity_by_patient <- readRDS(severity_rds) %>%
+  select(pat_record_id, baseline_severity_index, baseline_severity_coverage) %>%
+  distinct(pat_record_id, .keep_all = TRUE)
+
+outcome_propensity_by_patient <- readRDS(outcome_propensity_rds) %>%
+  select(pat_record_id, outcome_propensity) %>%
+  distinct(pat_record_id, .keep_all = TRUE)
+
+# Labels from the same Google Dictionary used in steps 03 and 04.
+dictionary_url <- "https://docs.google.com/spreadsheets/d/1bsOuvblNg1l3tNiAV8Se_Kf4_IcQjsRtxISyNzoQqLw/edit"
+dictionary_sheet <- "Dictionary"
+
+options(gargle_oauth_cache = TRUE)
+gs4_auth(email = TRUE, scopes = "spreadsheets.readonly")
+
+dictionary_raw <- read_sheet(
+  ss = dictionary_url,
+  sheet = dictionary_sheet,
+  na = c("", "NA", "N/A")
+)
+
+if (!all(c("Имя переменной", "Название") %in% names(dictionary_raw))) {
+  stop("В Google Dictionary отсутствуют колонки `Имя переменной` и/или `Название`.")
+}
+
+label_dictionary <- dictionary_raw %>%
+  transmute(
+    short = norm_txt(.data[["Имя переменной"]]),
+    ru = norm_txt(.data[["Название"]])
+  ) %>%
+  filter(!is.na(short), short != "", !is.na(ru), ru != "") %>%
+  distinct(short, .keep_all = TRUE)
+
+ru_map <- setNames(label_dictionary$ru, label_dictionary$short)
+dict_ha <- label_dictionary %>% select(short, ru)
+
+timepoint_t0 <- "m12h_0h"
+timepoint_t1 <- "48h_72h"
+min_pair_n <- 5
+```
+
+# Descriptive tables
+
+## Patient summary
+
+```{r}
+#| label: gtsummary-patients
+
+tp_top <- "m12h_0h"
+tps_bottom <- c("m12h_0h", "48h_72h", "4d_6d", "7d_10d")
+show_antibiotics <- FALSE
+
+pt_top <- patients_tidy %>%
+  filter(timepoint == tp_top) %>%
+  distinct(pat_record_id, .keep_all = TRUE) %>%
+  mutate(
+    vasopressors_if_used = case_when(
+      str_to_lower(vasopressors_if_used) == "да" ~ "Да",
+      str_to_lower(vasopressors_if_used) == "нет" ~ "Нет",
+      TRUE ~ NA_character_
+    ),
+    vasopressors_if_used = factor(vasopressors_if_used, levels = c("Да", "Нет")),
+    SIC_positive = case_when(
+      SIC_positive == 1 ~ "Да",
+      SIC_positive == 0 ~ "Нет",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("Да", "Нет"))
+  )
+
+if (isTRUE(show_antibiotics)) {
+  pt_top <- pt_top %>%
+    mutate(
+      antibiotics_started = case_when(
+        antibiotics_started_bin == 1L ~ "Да",
+        antibiotics_started_bin == 0L ~ "Нет",
+        TRUE ~ NA_character_
+      ),
+      antibiotics_started = factor(antibiotics_started, levels = c("Да", "Нет"))
+    )
+}
+
+pt_top <- pt_top %>%
+  mutate(
+    CT_count_pos = if_else(CT_count > 0, CT_count, NA_integer_),
+    LPS_count_pos = if_else(LPS_count > 0, LPS_count, NA_integer_),
+    devices_total_pos = if_else(devices_total > 0, devices_total, NA_integer_),
+    RRT_if_used = case_when(
+      RRT_required_baseline == 1L ~ "Да",
+      RRT_required_baseline == 0L ~ "Нет",
+      TRUE ~ NA_character_
+    ),
+    MV_if_used = case_when(
+      MV_required_baseline == 1L ~ "Да",
+      MV_required_baseline == 0L ~ "Нет",
+      TRUE ~ NA_character_
+    ),
+    RRT_if_used = factor(RRT_if_used, levels = c("Да", "Нет")),
+    MV_if_used = factor(MV_if_used, levels = c("Да", "Нет")),
+    pat_gram_stain = pat_gram_stain_for_tables(pat_gram_stain)
+  )
+
+vars_top <- c(
+  "age_yr", "sex", "BMI", "ICU_6_month_history", "from_other_ICU_transfer",
+  "icu_to_HA1_hours", "ICU_to_antibiotics_dt", "antibiotics_to_HA1_hours",
+  "vasopressors_if_used", "RRT_if_used", "MV_if_used", "charlson_index",
+  "pat_bacteremia", "pat_gram_stain", "pat_fungal",
+  "CT_count_pos", "LPS_count_pos", "devices_total_pos",
+  "HA_efficency_CGI_E", "outcome"
+)
+
+lbl_top <- list(
+  age_yr = ru_or("age_yr", ru_map),
+  sex = ru_or("sex", ru_map),
+  BMI = ru_or("BMI", ru_map),
+  ICU_6_month_history = ru_or("ICU_6_month_history", ru_map),
+  from_other_ICU_transfer = ru_or("from_other_ICU_transfer", ru_map),
+  icu_to_HA1_hours = "Время между поступлением в ОРИТ и началом ГС, ч",
+  ICU_to_antibiotics_dt = "Время от поступления в ОРИТ до начала АБ-терапии, ч",
+  antibiotics_to_HA1_hours = "Время от начала АБ-терапии до первой ГС, ч",
+  vasopressors_if_used = "Потребность в вазопрессорах",
+  RRT_if_used = "Потребность в ЗПТ",
+  MV_if_used = "Потребность в ИВЛ",
+  charlson_index = ru_or("charlson_index", ru_map),
+  pat_bacteremia = ru_or("pat_bacteremia", ru_map),
+  pat_gram_stain = "Бактериальная флора по Граму",
+  pat_fungal = ru_or("pat_fungal", ru_map),
+  CT_count_pos = "Устройств CT на пациента, n",
+  LPS_count_pos = "Устройств LPS на пациента, n",
+  devices_total_pos = "Всего устройств на пациента, n",
+  HA_efficency_CGI_E = ru_or("HA_efficency_CGI_E", ru_map),
+  outcome = ru_or("outcome", ru_map)
+)
+
+if (isTRUE(show_antibiotics) && "antibiotics_started" %in% names(pt_top)) {
+  vars_top <- c(vars_top, "antibiotics_started")
+  lbl_top$antibiotics_started <- "Антибиотики начаты (дата заполнена)"
+}
+
+lbl_top <- lbl_top[names(lbl_top) %in% vars_top]
+
+stat_top <- list(
+  all_continuous() ~ "{median} ({p25}, {p75})",
+  all_categorical() ~ "{p}% ({n})"
+)
+
+tbl_top <- pt_top %>%
+  select(any_of(vars_top)) %>%
+  tbl_summary(
+    type = list(
+      any_of(c("vasopressors_if_used", "RRT_if_used", "MV_if_used")) ~ "dichotomous"
+    ),
+    value = list(
+      any_of(c("vasopressors_if_used", "RRT_if_used", "MV_if_used")) ~ "Да"
+    ),
+    statistic = stat_top,
+    label = lbl_top,
+    missing = "no"
+  )
+```
+
+### Indications from patients_tidy RDS
+
+```{r}
+#| label: gtsummary-indications
+
+indication_labels <- c(
+  ind_bin_bacteremia = "Бактериемия (подтвержденная или подозреваемая)",
+  ind_bin_rhabdomyolysis = "Рабдомиолиз",
+  ind_bin_sepsis = "Сепсис (подтвержденный или подозреваемый)",
+  ind_bin_ischemia_reperfusion_injury = "Ишемия-реперфузионное повреждение",
+  ind_bin_septic_shock = "Септический шок",
+  ind_bin_massive_tissue_necrosis = "Массивный некроз тканей",
+  ind_bin_capillary_leak_syndrome = "Синдром капиллярной утечки",
+  ind_bin_acute_liver_failure = "Острая печёночная недостаточность",
+  ind_bin_multiorgan_failure = "Синдром полиорганной недостаточности (СПОН)",
+  ind_bin_acute_kidney_injury = "Острая почечная недостаточность",
+  ind_bin_elevated_lactate = "Повышенный уровень лактата",
+  ind_bin_systemic_inflammatory_response = "Синдром системного воспалительного ответа (ССВР)",
+  ind_bin_elevated_inflammatory_markers = "Повышенный уровень маркеров воспаления",
+  ind_bin_endogenous_intoxication = "Эндогенная интоксикация",
+  ind_bin_other = "Другое"
+)
+
+ind_cols <- intersect(names(indication_labels), names(pt_top))
+
+tbl_indications <- NULL
+
+if (length(ind_cols) > 0) {
+  ind_order <- pt_top %>%
+    summarise(across(all_of(ind_cols), ~ sum(.x == 1, na.rm = TRUE))) %>%
+    pivot_longer(everything(), names_to = "variable", values_to = "n_yes") %>%
+    arrange(desc(n_yes), variable) %>%
+    pull(variable)
+
+  ind_data <- pt_top %>%
+    select(all_of(ind_order)) %>%
+    mutate(
+      across(
+        everything(),
+        ~ case_when(
+          .x == 1 ~ "Да",
+          .x == 0 ~ "Нет",
+          TRUE ~ NA_character_
+        ) %>% factor(levels = c("Да", "Нет"))
+      )
+    )
+
+  tbl_indications <- ind_data %>%
+    tbl_summary(
+      type = everything() ~ "dichotomous",
+      value = everything() ~ "Да",
+      statistic = all_categorical() ~ "{p}% ({n})",
+      label = rlang::set_names(as.list(unname(indication_labels[ind_order])), ind_order),
+      missing = "no"
+    )
+}
+```
+
+### Timepoint parameters
+
+```{r}
+#| label: gtsummary-timepoints
+
+pt_bottom <- patients_tidy %>%
+  filter(timepoint %in% tps_bottom) %>%
+  mutate(
+    timepoint = factor(timepoint, levels = tps_bottom),
+    SIC_positive = case_when(
+      SIC_positive == 1 ~ "Да",
+      SIC_positive == 0 ~ "Нет",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("Да", "Нет"))
+  ) %>%
+  distinct(pat_record_id, timepoint, .keep_all = TRUE)
+
+vars_bottom <- c(
+  "SOFA", "VIS2020", "PaFiO2_calc", "INR", "SIC_score", "SIC_positive",
+  "lactate", "creatinine", "albumin", "C_react_protein", "procalcitonin",
+  "D_dimer", "fibrinogen", "bilirubin_total", "leucocytes", "lymphocytes",
+  "neutrophils", "NLR", "thrombocytes"
+)
+
+lbl_bottom <- list(
+  SOFA = ru_or("SOFA", ru_map),
+  VIS2020 = ru_or("VIS2020", ru_map),
+  PaFiO2_calc = paste0(ru_or("PaFiO2", ru_map), " (расч. по SpFiO2)"),
+  INR = "МНО",
+  SIC_score = "Индекс SIC, баллы",
+  SIC_positive = "SIC-положительный статус",
+  lactate = lab_u(ru_or("lactate", ru_map), unit_mode(pt_bottom$lactate_unit)),
+  creatinine = lab_u(ru_or("creatinine", ru_map), unit_mode(pt_bottom$creatinine_unit)),
+  albumin = lab_u(ru_or("albumin", ru_map), unit_mode(pt_bottom$albumin_unit)),
+  C_react_protein = lab_u(ru_or("C_react_protein", ru_map), unit_mode(pt_bottom$C_react_protein_unit)),
+  procalcitonin = lab_u(ru_or("procalcitonin", ru_map), unit_mode(pt_bottom$procalcitonin_unit)),
+  D_dimer = lab_u(ru_or("D_dimer", ru_map), unit_mode(pt_bottom$D_dimer_unit)),
+  fibrinogen = lab_u(ru_or("fibrinogen", ru_map), unit_mode(pt_bottom$fibrinogen_unit)),
+  bilirubin_total = lab_u(ru_or("bilirubin_total", ru_map), unit_mode(pt_bottom$bilirubin_total_unit)),
+  leucocytes = ru_or("leucocytes", ru_map),
+  lymphocytes = ru_or("lymphocytes", ru_map),
+  neutrophils = ru_or("neutrophils", ru_map),
+  NLR = "NLR (нейтрофилы/лимфоциты)",
+  thrombocytes = ru_or("thrombocytes", ru_map)
+)
+
+lbl_bottom <- lbl_bottom[names(lbl_bottom) %in% vars_bottom]
+
+tbl_bottom <- pt_bottom %>%
+  select(timepoint, any_of(vars_bottom)) %>%
+  tbl_summary(
+    by = timepoint,
+    type = list(any_of("SIC_positive") ~ "dichotomous"),
+    value = list(any_of("SIC_positive") ~ "Да"),
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{p}% ({n})"
+    ),
+    digits = list(NLR ~ 2),
+    label = lbl_bottom,
+    missing = "no"
+  )
+
+patient_tables <- list(tbl_top)
+patient_headers <- c("Общие характеристики")
+
+if (!is.null(tbl_indications)) {
+  patient_tables <- c(patient_tables, list(tbl_indications))
+  patient_headers <- c(patient_headers, "Показания к гемосорбции")
+}
+
+patient_tables <- c(patient_tables, list(tbl_bottom))
+patient_headers <- c(patient_headers, "Параметры по временным точкам")
+
+tbl_pat <- tbl_stack(patient_tables, group_header = patient_headers) %>%
+  modify_table_styling(rows = row_type == "label", columns = label, text_format = "bold") %>%
+  modify_table_styling(rows = row_type %in% c("group_header", "group"), columns = label, text_format = "bold") %>%
+  modify_caption("**2Reg: сводная таблица по пациентам**") %>%
+  modify_header(label = "**Параметр**")
+
+tbl_pat
+```
+
+## VIS summary
+
+```{r}
+#| label: gtsummary-vis
+
+tbl_vis <- patients_tidy %>%
+  select(timepoint, any_of(c("VIS2020", "VIS2020_0_excl"))) %>%
+  tbl_summary(
+    by = timepoint,
+    type = list(all_continuous() ~ "continuous"),
+    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})"),
+    label = list(
+      VIS2020 ~ "VIS2020",
+      VIS2020_0_excl ~ "VIS2020_0_excl"
+    ),
+    missing = "no"
+  )
+
+tbl_vis
+```
+
+## Hemoperfusion summary
+
+```{r}
+#| label: gtsummary-ha
+
+`%||%` <- function(x, y) {
+  if (!is.null(x) && length(x) && !is.na(x) && as.character(x) != "") x else y
+}
+
+ha_label_map <- tibble::deframe(dict_ha)
+label_list <- rlang::set_names(as.list(ha_label_map), names(ha_label_map))
+
+ha_proc <- HA_tidy %>%
+  mutate(
+    rrt_grp = case_when(
+      HA_with_RRT_bin == 1L ~ "В комбинации с ЗПТ",
+      HA_with_RRT_bin == 0L ~ "Изолированная гемосорбция",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("В комбинации с ЗПТ", "Изолированная гемосорбция")),
+    adverse_effects_filled = case_when(
+      HA_adverse_effects_recorded_bin == 1L ~ "Да",
+      HA_adverse_effects_recorded_bin == 0L ~ "Нет",
+      TRUE ~ NA_character_
+    )
+  )
+
+ha_tbl_data <- ha_proc %>%
+  select(
+    rrt_grp,
+    HA_cartrige_type,
+    HA_duration,
+    HA_avg_blood_flow,
+    HA_anticoagulation_cat,
+    adverse_effects_filled
+  )
+
+n_all <- nrow(ha_tbl_data)
+n_rrt <- sum(ha_tbl_data$rrt_grp == "В комбинации с ЗПТ", na.rm = TRUE)
+n_iso <- sum(ha_tbl_data$rrt_grp == "Изолированная гемосорбция", na.rm = TRUE)
+
+tbl_ha_gtsummary_compact <- ha_tbl_data %>%
+  tbl_summary(
+    by = rrt_grp,
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{p}% ({n})"
+    ),
+    missing = "no",
+    sort = all_categorical() ~ "frequency",
+    label = c(
+      label_list,
+      list(
+        HA_anticoagulation_cat = ha_label_map[["HA_anticoagulation"]] %||% "Антикоагуляция",
+        adverse_effects_filled = "Нежелательные явления: указано"
+      )
+    )
+  ) %>%
+  add_overall(last = FALSE) %>%
+  modify_header(
+    label ~ "**Параметр**",
+    stat_0 ~ paste0("**All (N=", n_all, ")**"),
+    stat_1 ~ paste0("**В комбинации с ЗПТ (N=", n_rrt, ")**"),
+    stat_2 ~ paste0("**Изолированная гемосорбция (N=", n_iso, ")**")
+  ) %>%
+  modify_caption("**Сводная таблица по сорбциям**") %>%
+  bold_labels()
+
+tbl_ha_gtsummary_compact
+```
+
+## Save reusable descriptive objects
+
+```{r}
+#| label: save-descriptive
+
+saveRDS(
+  list(
+    tbl_pat = tbl_pat,
+    tbl_vis = tbl_vis,
+    tbl_ha_gtsummary_compact = tbl_ha_gtsummary_compact
+  ),
+  file.path(ANALYSIS_DATA_DIR, "descriptive_tables.rds")
+)
+```
+
+# Expanded correlation analysis
+
+## First sorption variables
+
+```{r}
+#| label: correlation-first-sorption
+
+ha_first_corr <- HA_tidy %>%
+  filter(HA_parameter == "Гемоперфузия 1") %>%
+  arrange(pat_record_id, HA_start_dt) %>%
+  group_by(pat_record_id) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  transmute(
+    pat_record_id,
+    HA1_start_datetime = HA_start_dt,
+    HA_duration,
+    HA_avg_blood_flow,
+    first_sorption_LPS = HA_cartridge_LPS_bin,
+    HA_anticoag_heparin,
+    HA_other_methods_bin,
+    HA_adverse_effects_bin
+  )
+```
+
+## Baseline correlation dataset
+
+```{r}
+#| label: correlation-baseline-data
+
+corr_t0 <- patients_tidy %>%
+  filter(timepoint == timepoint_t0) %>%
+  arrange(pat_record_id) %>%
+  distinct(pat_record_id, .keep_all = TRUE) %>%
+  left_join(ha_first_corr, by = "pat_record_id") %>%
+  left_join(
+    baseline_severity_by_patient %>%
+      select(pat_record_id, baseline_severity_index),
+    by = "pat_record_id"
+  ) %>%
+  left_join(
+    outcome_propensity_by_patient %>%
+      select(pat_record_id, outcome_propensity),
+    by = "pat_record_id"
+  ) %>%
+  mutate(
+    is_septic_bin = bin_from_any(is_septic),
+    is_lps_72h = bin_from_any(is_lps_72h),
+    SIC_positive = bin_from_any(SIC_positive),
+    # Не используем as.integer(factor): он возвращает внутренние коды уровней,
+    # а не клинические значения 0/1.
+    culture_gram_plus_bin = bin_from_any(is_pat_gram_plus),
+    culture_gram_minus_bin = bin_from_any(is_pat_gram_minus),
+    culture_bacteremia_bin = bin_from_any(is_bacteremic),
+    culture_fungal_bin = bin_from_any(is_pat_fungal)
+  )
+
+```
+
+## Dynamics 0–48 h
+
+```{r}
+#| label: correlation-dynamics
+
+dyn_vars <- intersect(
+  c(
+    "SOFA", "VIS2020_0_excl", "thrombocytes", "lymphocytes",
+    "neutrophils", "NLR", "creatinine", "C_react_protein",
+    "bilirubin_total"
+  ),
+  names(patients_tidy)
+)
+
+patients_dyn_delta <- patients_tidy %>%
+  filter(timepoint %in% c(timepoint_t0, timepoint_t1)) %>%
+  select(pat_record_id, timepoint, all_of(dyn_vars)) %>%
+  pivot_longer(
+    cols = all_of(dyn_vars),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  group_by(pat_record_id, variable, timepoint) %>%
+  summarise(value = first_non_na(value), .groups = "drop") %>%
+  pivot_wider(names_from = timepoint, values_from = value) %>%
+  filter(all(c(timepoint_t0, timepoint_t1) %in% names(.))) %>%
+  mutate(delta = .data[[timepoint_t1]] - .data[[timepoint_t0]]) %>%
+  select(pat_record_id, variable, delta) %>%
+  mutate(
+    variable = recode(
+      variable,
+      "VIS2020_0_excl" = "VIS2020",
+      "thrombocytes" = "PLT",
+      "lymphocytes" = "LYM",
+      "neutrophils" = "NEU",
+      "creatinine" = "Crea",
+      "C_react_protein" = "CRP",
+      "bilirubin_total" = "bilirubin"
+    ),
+    variable = paste0("delta_", variable)
+  ) %>%
+  pivot_wider(names_from = variable, values_from = delta)
+
+corr_full <- corr_t0 %>%
+  left_join(patients_dyn_delta, by = "pat_record_id")
+
+cgi_levels <- c(
+  "Без изменений или хуже",
+  "Минимальное улучшение. Незначительное улучшение, не влияющее на клинический статус пациента",
+  "Умеренное улучшение. Частичная ремиссия симптомов",
+  "Отмечено значительное улучшение. Полная или почти полная ремиссия симптомов"
+)
+
+corr_full <- corr_full %>%
+  mutate(
+    HA_efficency_CGI_E = factor(
+      HA_efficency_CGI_E,
+      levels = cgi_levels,
+      ordered = TRUE
+    )
+  )
+```
+
+## Numeric matrix and labels
+
+```{r}
+#| label: correlation-matrix-input
+
+diag_vars <- names(corr_full)[str_detect(names(corr_full), "^diag_bin_")]
+ind_vars <- names(corr_full)[str_detect(names(corr_full), "^ind_bin_")]
+
+culture_vars <- intersect(
+  c(
+    "culture_gram_plus_bin", "culture_gram_minus_bin",
+    "culture_bacteremia_bin", "culture_fungal_bin"
+  ),
+  names(corr_full)
+)
+
+corr_full <- corr_full %>%
+  mutate(
+    across(
+      any_of(c(
+        diag_vars, ind_vars, culture_vars,
+        "ICU_6_month_history_bin", "is_septic_bin", "ECMO_if_used_bin",
+        "is_lps_72h", "first_sorption_LPS", "SIC_positive"
+      )),
+      bin_from_any
+    )
+  )
+
+corr_vars <- c(
+  "age_yr", "sex_male_bin", "BMI", "charlson_index", "ICU_6_month_history_bin",
+  "baseline_severity_index", "SOFA", "VIS2020_0_excl", "INR", "SIC_score", "SIC_positive",
+  "PaFiO2_calc", "PaFiO2", "SpFiO2", "avg_BP",
+  "vasopressors_if_used_bin", "RRT_if_used_bin", "MV_if_used_bin",
+  "ECMO_if_used_bin", "from_other_ICU_transfer_bin", "is_septic_bin",
+  "vasopressors_dur_hours", "RRT_dur_hours", "MV_dur_hours", "ECMO_dur_hours",
+  "ICU_to_antibiotics_dt", culture_vars, diag_vars, ind_vars,
+  "lactate", "creatinine", "albumin", "C_react_protein", "procalcitonin",
+  "D_dimer", "fibrinogen", "leucocytes", "lymphocytes", "neutrophils", "NLR",
+  "thrombocytes", "bilirubin_total", "icu_to_HA1_hours", "antibiotics_to_HA1_hours",
+  "HA_duration", "HA_avg_blood_flow", "first_sorption_LPS", "is_lps_72h",
+  "HA_anticoag_heparin", "HA_other_methods_bin", "HA_adverse_effects_bin",
+  "HA_efficency_CGI_E", "delta_SOFA", "delta_VIS2020", "delta_PLT",
+  "delta_LYM", "delta_NEU", "delta_NLR", "delta_Crea", "delta_CRP",
+  "delta_bilirubin", "outcome_days", "outcome_dead_bin", "outcome_propensity"
+)
+
+corr_numeric <- corr_full %>%
+  select(any_of(corr_vars)) %>%
+  mutate(
+    across(where(is.ordered), as.integer),
+    across(where(is.logical), as.integer)
+  ) %>%
+  select(where(is.numeric)) %>%
+  select(
+    where(~ sum(!is.na(.x)) >= min_pair_n && n_distinct(.x, na.rm = TRUE) > 1)
+  )
+
+zero_sd_vars <- corr_numeric %>%
+  summarise(across(everything(), ~ sd(.x, na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "sd") %>%
+  filter(is.na(sd) | sd == 0)
+
+if (nrow(zero_sd_vars) > 0) {
+  corr_numeric <- corr_numeric %>%
+    select(-all_of(zero_sd_vars$variable))
+}
+
+diag_label_map <- setNames(paste0("dx_", str_remove(diag_vars, "^diag_bin_")), diag_vars)
+diag_label_fixed <- c(
+  diag_bin_malignancy = "dx_malignancy",
+  diag_bin_urinary_tract_infection = "dx_UTI",
+  diag_bin_soft_tissue_infection = "dx_SSTI",
+  diag_bin_meningitis = "dx_meningitis",
+  diag_bin_burn_inhalation_injury = "dx_burn_inh",
+  diag_bin_osteomyelitis = "dx_osteo",
+  diag_bin_acute_pancreatitis = "dx_pancreatitis",
+  diag_bin_peritonitis = "dx_peritonitis",
+  diag_bin_pyelonephritis = "dx_pyelonephritis",
+  diag_bin_pneumonia = "dx_pneumonia",
+  diag_bin_post_major_surgery = "dx_surgery",
+  diag_bin_trauma = "dx_trauma",
+  diag_bin_cholangitis_biliary_infection = "dx_cholangitis",
+  diag_bin_exogenous_intoxication = "dx_intox",
+  diag_bin_endocarditis = "dx_endocarditis",
+  diag_bin_other = "dx_other"
+)
+diag_label_map[names(diag_label_fixed)] <- diag_label_fixed[names(diag_label_fixed)]
+diag_label_map <- diag_label_map[names(diag_label_map) %in% diag_vars]
+
+ind_label_map <- setNames(paste0("ind_", str_remove(ind_vars, "^ind_bin_")), ind_vars)
+ind_label_fixed <- c(
+  ind_bin_bacteremia = "ind_bacteremia",
+  ind_bin_rhabdomyolysis = "ind_rhabdo",
+  ind_bin_sepsis = "ind_sepsis",
+  ind_bin_ischemia_reperfusion_injury = "ind_I_R",
+  ind_bin_septic_shock = "ind_shock",
+  ind_bin_massive_tissue_necrosis = "ind_necrosis",
+  ind_bin_capillary_leak_syndrome = "ind_cap_leak",
+  ind_bin_acute_liver_failure = "ind_ALF",
+  ind_bin_multiorgan_failure = "ind_MOF",
+  ind_bin_acute_kidney_injury = "ind_AKI",
+  ind_bin_elevated_lactate = "ind_lactate",
+  ind_bin_systemic_inflammatory_response = "ind_SIRS",
+  ind_bin_elevated_inflammatory_markers = "ind_infl_markers",
+  ind_bin_endogenous_intoxication = "ind_endotox",
+  ind_bin_other = "ind_other"
+)
+ind_label_map[names(ind_label_fixed)] <- ind_label_fixed[names(ind_label_fixed)]
+ind_label_map <- ind_label_map[names(ind_label_map) %in% ind_vars]
+
+corr_label_map <- c(
+  age_yr = "Age", sex_male_bin = "Male", BMI = "BMI", charlson_index = "Charlson",
+  ICU_6_month_history_bin = "ICU_6m", baseline_severity_index = "severity_index", SOFA = "SOFA", VIS2020_0_excl = "VIS",
+  INR = "INR", SIC_score = "SIC_score", SIC_positive = "SIC_positive",
+  PaFiO2_calc = "PF_ratio", PaFiO2 = "PaFiO2", SpFiO2 = "SpFiO2", avg_BP = "avg_BP",
+  vasopressors_if_used_bin = "Vaso", RRT_if_used_bin = "RRT", MV_if_used_bin = "MV",
+  ECMO_if_used_bin = "ECMO", from_other_ICU_transfer_bin = "Transfer", is_septic_bin = "septic",
+  vasopressors_dur_hours = "Vaso_dur_h", RRT_dur_hours = "RRT_dur_h",
+  MV_dur_hours = "MV_dur_h", ECMO_dur_hours = "ECMO_dur_h",
+  ICU_to_antibiotics_dt = "ICU_to_AB_h", culture_gram_plus_bin = "cult_Gram_plus",
+  culture_gram_minus_bin = "cult_Gram_minus", culture_bacteremia_bin = "cult_bacteremia",
+  culture_fungal_bin = "cult_fungal", lactate = "lactate", creatinine = "creatinine",
+  albumin = "albumin", C_react_protein = "CRP", procalcitonin = "PCT",
+  D_dimer = "D_dimer", fibrinogen = "fibrinogen", leucocytes = "WBC",
+  lymphocytes = "LYM", neutrophils = "NEU", NLR = "NLR", thrombocytes = "PLT",
+  bilirubin_total = "bilirubin", icu_to_HA1_hours = "ICU_to_HA_h",
+  antibiotics_to_HA1_hours = "AB_to_HA_h", HA_duration = "HA_duration",
+  HA_avg_blood_flow = "blood_flow", first_sorption_LPS = "first_LPS", is_lps_72h = "LPS_72h",
+  HA_anticoag_heparin = "Heparin", HA_other_methods_bin = "other_ECM",
+  HA_adverse_effects_bin = "AE_HA", HA_efficency_CGI_E = "CGI_E",
+  delta_SOFA = "dSOFA", delta_VIS2020 = "dVIS", delta_PLT = "dPLT", delta_LYM = "dLYM",
+  delta_NEU = "dNEU", delta_NLR = "dNLR", delta_Crea = "dCrea", delta_CRP = "dCRP",
+  delta_bilirubin = "dBili", outcome_days = "outcome_days", outcome_dead_bin = "death",
+  outcome_propensity = "outcome_score", diag_label_map, ind_label_map
+)
+
+corr_numeric_plot <- corr_numeric
+new_names <- names(corr_numeric_plot)
+new_names <- ifelse(new_names %in% names(corr_label_map), corr_label_map[new_names], new_names)
+names(corr_numeric_plot) <- make.unique(unname(new_names), sep = "_")
+
+saveRDS(
+  list(
+    corr_numeric_plot = corr_numeric_plot,
+    corr_label_map = corr_label_map,
+    diag_label_map = diag_label_map,
+    ind_label_map = ind_label_map,
+    min_pair_n = min_pair_n
+  ),
+  file.path(ANALYSIS_DATA_DIR, "correlation_input.rds")
+)
+
+cat("Correlation input saved:", nrow(corr_numeric_plot), "rows x", ncol(corr_numeric_plot), "variables\n")
+```
+
+## Kendall correlation at baseline
+
+```{r}
+#| label: kendall-baseline
+
+vars_corr <- c(
+  "age_yr", "BMI", "SOFA", "icu_to_HA1_hours", "VIS2020", "PaFiO2_calc",
+  "lactate", "creatinine", "albumin", "C_react_protein", "procalcitonin",
+  "D_dimer", "fibrinogen", "leucocytes", "lymphocytes", "neutrophils",
+  "NLR", "thrombocytes"
+)
+
+pt_corr <- patients_tidy %>%
+  filter(timepoint == "m12h_0h") %>%
+  distinct(pat_record_id, .keep_all = TRUE) %>%
+  select(any_of(vars_corr)) %>%
+  mutate(across(everything(), ~ suppressWarnings(as.numeric(.x)))) %>%
+  select(where(~ sum(!is.na(.x)) >= 2))
+
+if (ncol(pt_corr) >= 2) {
+  cor_mat_kendall <- cor(
+    pt_corr,
+    method = "kendall",
+    use = "pairwise.complete.obs"
+  )
+
+  cor_mat_tri <- cor_mat_kendall
+  cor_mat_tri[upper.tri(cor_mat_tri, diag = FALSE)] <- NA
+
+  print(round(cor_mat_tri, 2))
+
+  cor_tbl <- as.data.frame(as.table(cor_mat_tri)) %>%
+    rename(var1 = Var1, var2 = Var2, tau = Freq) %>%
+    mutate(
+      var1 = factor(var1, levels = colnames(cor_mat_tri)),
+      var2 = factor(var2, levels = colnames(cor_mat_tri))
+    ) %>%
+    filter(!is.na(tau))
+
+  ggplot(cor_tbl, aes(var1, var2, fill = tau)) +
+    geom_tile(color = "white", linewidth = 0.3) +
+    geom_text(aes(label = sprintf("%.2f", tau)), size = 3) +
+    scale_fill_gradient2(limits = c(-1, 1)) +
+    coord_fixed() +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.title = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      panel.grid = element_blank()
+    ) +
+    labs(title = "Kendall τ, m12h_0h", fill = "Kendall τ")
+} else {
+  cat("Недостаточно данных для Kendall correlations.\n")
+}
+```
+
+## Spearman matrices
+
+```{r}
+#| label: spearman-matrices
+
+M <- cor_matrix_safe(
+  corr_numeric_plot,
+  method = "spearman",
+  min_n = min_pair_n
+)
+
+P <- cor_pmat(
+  corr_numeric_plot,
+  method = "spearman",
+  min_n = min_pair_n
+)
+
+order_block_hclust <- function(vars, M) {
+  vars <- intersect(vars, colnames(M))
+  if (length(vars) <= 2) return(vars)
+
+  M_block <- M[vars, vars, drop = FALSE]
+  M_block[is.na(M_block)] <- 0
+  diag(M_block) <- 1
+
+  vars[corrplot::corrMatOrder(
+    abs(M_block),
+    order = "hclust",
+    hclust.method = "ward.D2"
+  )]
+}
+
+block_vars <- list(
+  demo = c("Age", "Male", "BMI", "Charlson", "ICU_6m"),
+  clinical = c(
+    "severity_index", "SOFA", "VIS", "INR", "SIC_score", "SIC_positive", "PF_ratio",
+    "PaFiO2", "SpFiO2", "avg_BP", "Vaso", "RRT", "MV", "ECMO",
+    "Transfer", "septic", "Vaso_dur_h", "RRT_dur_h", "MV_dur_h",
+    "ECMO_dur_h", "ICU_to_AB_h"
+  ),
+  cultures = c("cult_Gram_plus", "cult_Gram_minus", "cult_bacteremia", "cult_fungal"),
+  diagnoses = unname(diag_label_map),
+  indications = unname(ind_label_map),
+  labs = c(
+    "lactate", "creatinine", "albumin", "CRP", "PCT", "D_dimer",
+    "fibrinogen", "WBC", "LYM", "NEU", "NLR", "PLT", "bilirubin"
+  ),
+  sorption = c(
+    "ICU_to_HA_h", "AB_to_HA_h", "HA_duration", "blood_flow", "first_LPS",
+    "LPS_72h", "Heparin", "other_ECM", "AE_HA", "CGI_E"
+  ),
+  dynamics = c("dSOFA", "dVIS", "dPLT", "dLYM", "dNEU", "dNLR", "dCrea", "dCRP", "dBili"),
+  outcomes = c("outcome_days", "death", "outcome_score")
+)
+
+block_order <- block_vars %>%
+  map(~ order_block_hclust(.x, M)) %>%
+  unlist(use.names = FALSE)
+
+final_order <- c(block_order, setdiff(colnames(M), block_order))
+
+M_manual <- M[final_order, final_order, drop = FALSE]
+P_manual <- P[final_order, final_order, drop = FALSE]
+
+M_for_order <- M
+M_for_order[is.na(M_for_order)] <- 0
+diag(M_for_order) <- 1
+
+hclust_order <- corrplot::corrMatOrder(
+  abs(M_for_order),
+  order = "hclust",
+  hclust.method = "ward.D2"
+)
+
+M_hclust <- M[hclust_order, hclust_order, drop = FALSE]
+P_hclust <- P[hclust_order, hclust_order, drop = FALSE]
+
+P_manual_plot <- prep_p_for_corrplot(P_manual, M_manual)
+P_hclust_plot <- prep_p_for_corrplot(P_hclust, M_hclust)
+```
+
+### Block order
+
+```{r}
+#| label: spearman-block-order
+#| fig-width: 24
+#| fig-height: 24
+
+plot_corr_full(
+  M_manual,
+  P_manual_plot,
+  title = "Spearman correlation matrix, expanded, block order",
+  tl_cex = 0.42,
+  pch_cex = 0.42
+)
+```
+
+### Automatic hclust order
+
+```{r}
+#| label: spearman-hclust-order
+#| fig-width: 24
+#| fig-height: 24
+
+plot_corr_full(
+  M_hclust,
+  P_hclust_plot,
+  title = "Spearman correlation matrix, expanded, hclust order",
+  tl_cex = 0.42,
+  pch_cex = 0.42
+)
+```
+
+## Save
+
+```{r}
+#| label: save-spearman
+
+corr_width <- max(18, 0.28 * ncol(M_hclust))
+corr_height <- max(18, 0.28 * ncol(M_hclust))
+
+svg(
+  filename = file.path(GRAPHES_DIR, "corr_spearman_expanded.svg"),
+  width = corr_width,
+  height = corr_height
+)
+plot_corr_full(
+  M_hclust,
+  P_hclust_plot,
+  title = "Spearman correlation matrix, expanded",
+  tl_cex = 0.7,
+  pch_cex = 0.42
+)
+dev.off()
+
+pdf(
+  file = file.path(GRAPHES_DIR, "corr_spearman_expanded.pdf"),
+  width = corr_width,
+  height = corr_height,
+  useDingbats = FALSE
+)
+plot_corr_full(
+  M_hclust,
+  P_hclust_plot,
+  title = "Spearman correlation matrix, expanded",
+  tl_cex = 0.7,
+  pch_cex = 0.42
+)
+dev.off()
+
+saveRDS(
+  list(
+    M = M,
+    P = P,
+    final_order = final_order,
+    hclust_order = hclust_order
+  ),
+  file.path(ANALYSIS_DATA_DIR, "ordinary_correlations.rds")
+)
+```
+
+# SOFA-adjusted partial correlations
+
+## Ordinary and partial Spearman matrices
+
+```{r}
+#| label: partial-spearman
+
+M <- cor_matrix_safe(
+  corr_numeric_plot,
+  method = "spearman",
+  min_n = min_pair_n
+)
+
+P <- cor_pmat(
+  corr_numeric_plot,
+  method = "spearman",
+  min_n = min_pair_n
+)
+
+control_var <- "SOFA"
+
+partial_sofa <- partial_spearman_matrix_safe(
+  corr_numeric_plot,
+  control_var = control_var,
+  min_n = min_pair_n
+)
+
+M_partial_SOFA <- partial_sofa$r
+P_partial_SOFA <- partial_sofa$p
+
+M_for_combo_order <- M
+M_for_combo_order[is.na(M_for_combo_order)] <- 0
+diag(M_for_combo_order) <- 1
+
+combo_order <- corrplot::corrMatOrder(
+  abs(M_for_combo_order),
+  order = "hclust",
+  hclust.method = "ward.D2"
+) %>%
+  { colnames(M)[.] }
+
+combo_order <- combo_order[
+  combo_order %in% colnames(M) & combo_order %in% colnames(P)
+]
+
+M_raw_combo <- M[combo_order, combo_order, drop = FALSE]
+P_raw_combo <- P[combo_order, combo_order, drop = FALSE]
+
+M_combo_SOFA <- M_raw_combo
+P_combo_SOFA <- P_raw_combo
+
+M_combo_SOFA[upper.tri(M_combo_SOFA)] <- NA
+P_combo_SOFA[upper.tri(P_combo_SOFA)] <- NA
+
+partial_vars <- setdiff(combo_order, control_var)
+partial_vars <- partial_vars[
+  partial_vars %in% colnames(M_partial_SOFA) &
+    partial_vars %in% colnames(P_partial_SOFA)
+]
+
+if (length(partial_vars) >= 2) {
+  for (i in seq_len(length(partial_vars) - 1)) {
+    for (j in (i + 1):length(partial_vars)) {
+      v1 <- partial_vars[[i]]
+      v2 <- partial_vars[[j]]
+      M_combo_SOFA[v1, v2] <- M_partial_SOFA[v1, v2]
+      P_combo_SOFA[v1, v2] <- P_partial_SOFA[v1, v2]
+    }
+  }
+}
+
+diag(M_combo_SOFA) <- 1
+diag(P_combo_SOFA) <- 0
+P_combo_SOFA_plot <- prep_p_for_corrplot(P_combo_SOFA, M_combo_SOFA)
+```
+
+## Plots
+
+```{r}
+#| label: partial-spearman-plots
+#| fig-width: 24
+#| fig-height: 24
+
+plot_corr_full(
+  M_combo_SOFA,
+  P_combo_SOFA_plot,
+  title = "Lower triangle: ordinary Spearman; upper triangle: partial Spearman adjusted for SOFA",
+  tl_cex = 0.7,
+  pch_cex = 0.5,
+  show_numbers = FALSE
+)
+
+p_tiles_SOFA <- plot_corr_tiles(
+  M_combo_SOFA,
+  P_combo_SOFA_plot,
+  title = "Spearman and SOFA-adjusted partial Spearman correlation matrix",
+  subtitle = "Lower triangle: ordinary Spearman; upper triangle: partial Spearman adjusted for SOFA",
+  show_stars = TRUE,
+  show_diagonal = TRUE,
+  text_size = 1.3,
+  coef_size = 1.7
+)
+
+p_tiles_SOFA
+```
+
+## Save
+
+```{r}
+#| label: save-partial-spearman
+
+corr_width <- max(24, 0.42 * ncol(M_combo_SOFA))
+corr_height <- max(24, 0.42 * ncol(M_combo_SOFA))
+
+svg(
+  filename = file.path(GRAPHES_DIR, "corr_spearman_combo_partial_SOFA.svg"),
+  width = corr_width,
+  height = corr_height
+)
+plot_corr_full(
+  M_combo_SOFA,
+  P_combo_SOFA_plot,
+  title = "Lower triangle: ordinary Spearman; upper triangle: partial Spearman adjusted for SOFA",
+  tl_cex = 0.7,
+  pch_cex = 0.5,
+  show_numbers = FALSE
+)
+dev.off()
+
+pdf(
+  file = file.path(GRAPHES_DIR, "corr_spearman_combo_partial_SOFA.pdf"),
+  width = corr_width,
+  height = corr_height,
+  useDingbats = FALSE
+)
+plot_corr_full(
+  M_combo_SOFA,
+  P_combo_SOFA_plot,
+  title = "Lower triangle: ordinary Spearman; upper triangle: partial Spearman adjusted for SOFA",
+  tl_cex = 0.7,
+  pch_cex = 0.5,
+  show_numbers = FALSE
+)
+dev.off()
+
+ggsave(
+  filename = file.path(GRAPHES_DIR, "corr_spearman_combo_partial_SOFA_tiles.svg"),
+  plot = p_tiles_SOFA,
+  width = corr_width,
+  height = corr_height,
+  units = "in",
+  limitsize = FALSE
+)
+
+ggsave(
+  filename = file.path(GRAPHES_DIR, "corr_spearman_combo_partial_SOFA_tiles.pdf"),
+  plot = p_tiles_SOFA,
+  width = corr_width,
+  height = corr_height,
+  units = "in",
+  device = cairo_pdf,
+  limitsize = FALSE
+)
+
+saveRDS(
+  list(
+    M_combo_SOFA = M_combo_SOFA,
+    P_combo_SOFA = P_combo_SOFA,
+    combo_order = combo_order
+  ),
+  file.path(ANALYSIS_DATA_DIR, "partial_correlations_SOFA.rds")
+)
+
+tibble(position = seq_along(combo_order), variable = combo_order)
+```
+
+# Baseline subgroup tables
+
+## Common T0 dataset
+
+```{r}
+#| label: t0-setup
+
+pt_top <- patients_tidy %>%
+  filter(timepoint == "m12h_0h") %>%
+  distinct(pat_record_id, .keep_all = TRUE) %>%
+  mutate(
+    vasopressors_if_used = case_when(
+      str_to_lower(vasopressors_if_used) == "да" ~ "Да",
+      str_to_lower(vasopressors_if_used) == "нет" ~ "Нет",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("Да", "Нет")),
+    RRT_if_used = case_when(
+      RRT_required_baseline == 1L ~ "Да",
+      RRT_required_baseline == 0L ~ "Нет",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("Да", "Нет")),
+    MV_if_used = case_when(
+      MV_required_baseline == 1L ~ "Да",
+      MV_required_baseline == 0L ~ "Нет",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("Да", "Нет")),
+    SIC_positive = case_when(
+      SIC_positive == 1 ~ "Да",
+      SIC_positive == 0 ~ "Нет",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("Да", "Нет"))
+  )
+
+vars_t0_compare <- c(
+  "age_yr", "sex", "BMI", "ICU_6_month_history", "from_other_ICU_transfer",
+  "vasopressors_if_used", "RRT_if_used", "MV_if_used", "charlson_index",
+  "pat_bacteremia", "pat_gram_stain", "pat_fungal",
+  "SOFA", "VIS2020", "PaFiO2_calc", "INR", "SIC_score", "SIC_positive",
+  "lactate", "creatinine", "albumin", "C_react_protein", "procalcitonin",
+  "D_dimer", "fibrinogen", "bilirubin_total", "leucocytes", "lymphocytes",
+  "neutrophils", "NLR", "thrombocytes"
+) %>%
+  intersect(names(pt_top))
+
+lbl_t0_compare <- list(
+  age_yr = ru_or("age_yr", ru_map),
+  sex = ru_or("sex", ru_map),
+  BMI = ru_or("BMI", ru_map),
+  ICU_6_month_history = ru_or("ICU_6_month_history", ru_map),
+  from_other_ICU_transfer = ru_or("from_other_ICU_transfer", ru_map),
+  vasopressors_if_used = "Потребность в вазопрессорах",
+  RRT_if_used = "Потребность в ЗПТ",
+  MV_if_used = "Потребность в ИВЛ",
+  charlson_index = ru_or("charlson_index", ru_map),
+  pat_bacteremia = ru_or("pat_bacteremia", ru_map),
+  pat_gram_stain = "Бактериальная флора по Граму",
+  pat_fungal = ru_or("pat_fungal", ru_map),
+  SOFA = ru_or("SOFA", ru_map),
+  VIS2020 = ru_or("VIS2020", ru_map),
+  PaFiO2_calc = "PaO2/FiO2 (расч.)",
+  INR = "МНО",
+  SIC_score = "Индекс SIC, баллы",
+  SIC_positive = "SIC-положительный статус",
+  lactate = ru_or("lactate", ru_map),
+  creatinine = ru_or("creatinine", ru_map),
+  albumin = ru_or("albumin", ru_map),
+  C_react_protein = ru_or("C_react_protein", ru_map),
+  procalcitonin = ru_or("procalcitonin", ru_map),
+  D_dimer = ru_or("D_dimer", ru_map),
+  fibrinogen = ru_or("fibrinogen", ru_map),
+  bilirubin_total = ru_or("bilirubin_total", ru_map),
+  leucocytes = ru_or("leucocytes", ru_map),
+  lymphocytes = ru_or("lymphocytes", ru_map),
+  neutrophils = ru_or("neutrophils", ru_map),
+  NLR = "NLR",
+  thrombocytes = ru_or("thrombocytes", ru_map)
+)
+lbl_t0_compare <- lbl_t0_compare[names(lbl_t0_compare) %in% vars_t0_compare]
+
+stat_t0 <- list(
+  all_continuous() ~ "{median} ({p25}, {p75})",
+  all_categorical() ~ "{p}% ({n})"
+)
+```
+
+## T0: 24-hour landmark early vs late sorption
+
+```{r}
+#| label: t0-landmark
+
+landmark_hours <- 24
+landmark_days <- landmark_hours / 24
+
+landmark_ids <- patients_tidy %>%
+  group_by(pat_record_id) %>%
+  summarise(
+    icu_to_HA1_hours = first_non_na(icu_to_HA1_hours),
+    outcome_days = first_non_na(outcome_days),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(icu_to_HA1_hours)) %>%
+  filter(is.na(outcome_days) | outcome_days >= 0) %>%
+  filter(is.na(outcome_days) | outcome_days > landmark_days) %>%
+  mutate(
+    sorption_by_landmark = if_else(
+      icu_to_HA1_hours <= landmark_hours,
+      paste0("ГС до ", landmark_hours, " ч"),
+      paste0("ГС после ", landmark_hours, " ч")
+    ) %>% factor(levels = c(
+      paste0("ГС до ", landmark_hours, " ч"),
+      paste0("ГС после ", landmark_hours, " ч")
+    ))
+  )
+
+pt_landmark_t0 <- pt_top %>%
+  inner_join(landmark_ids %>% select(pat_record_id, sorption_by_landmark), by = "pat_record_id")
+
+tbl_baseline_landmark_sorption <- pt_landmark_t0 %>%
+  select(sorption_by_landmark, any_of(vars_t0_compare)) %>%
+  tbl_summary(
+    by = sorption_by_landmark,
+    type = list(any_of(c(
+      "vasopressors_if_used", "RRT_if_used", "MV_if_used",
+      "from_other_ICU_transfer", "SIC_positive"
+    )) ~ "dichotomous"),
+    value = list(any_of(c(
+      "vasopressors_if_used", "RRT_if_used", "MV_if_used",
+      "from_other_ICU_transfer", "SIC_positive"
+    )) ~ "Да"),
+    statistic = stat_t0,
+    label = lbl_t0_compare,
+    missing = "no"
+  ) %>%
+  add_n() %>%
+  add_p(test = list(all_continuous() ~ "wilcox.test", all_categorical() ~ "fisher.test")) %>%
+  modify_header(label ~ "**Показатель на T0**", all_stat_cols() ~ "**{level}**, N = {n}", p.value ~ "**p**") %>%
+  bold_labels()
+
+tbl_baseline_landmark_sorption
+```
+
+## T0: transfer from another ICU
+
+```{r}
+#| label: t0-transfer
+
+pt_transfer_t0 <- pt_top %>%
+  mutate(
+    transfer_group = case_when(
+      from_other_ICU_transfer == "Да" ~ "Переведён из другого ОРИТ",
+      from_other_ICU_transfer == "Нет" ~ "Не переведён из другого ОРИТ",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("Переведён из другого ОРИТ", "Не переведён из другого ОРИТ"))
+  ) %>%
+  filter(!is.na(transfer_group))
+
+vars_transfer_compare <- setdiff(vars_t0_compare, "from_other_ICU_transfer")
+
+tbl_baseline_transfer <- pt_transfer_t0 %>%
+  select(transfer_group, any_of(vars_transfer_compare)) %>%
+  tbl_summary(
+    by = transfer_group,
+    type = list(any_of(c("vasopressors_if_used", "RRT_if_used", "MV_if_used", "SIC_positive")) ~ "dichotomous"),
+    value = list(any_of(c("vasopressors_if_used", "RRT_if_used", "MV_if_used", "SIC_positive")) ~ "Да"),
+    statistic = stat_t0,
+    label = lbl_t0_compare[names(lbl_t0_compare) %in% vars_transfer_compare],
+    missing = "no"
+  ) %>%
+  add_n() %>%
+  add_p(test = list(all_continuous() ~ "wilcox.test", all_categorical() ~ "fisher.test")) %>%
+  modify_header(label ~ "**Показатель на T0**", all_stat_cols() ~ "**{level}**, N = {n}", p.value ~ "**p**") %>%
+  bold_labels()
+
+tbl_baseline_transfer
+```
+
+## T0: anticoagulation at first hemoperfusion
+
+```{r}
+#| label: t0-anticoagulation
+
+ha1_anticoagulation <- HA_tidy %>%
+  filter(HA_parameter == "Гемоперфузия 1") %>%
+  arrange(pat_record_id, HA_start_dt) %>%
+  group_by(pat_record_id) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  transmute(
+    pat_record_id,
+    HA_anticoagulation_cat = case_when(
+      HA_anticoagulation_cat == "Цитрат" ~ "Цитрат",
+      HA_anticoagulation_cat == "Гепарин" ~ "Гепарин",
+      HA_anticoagulation_cat %in% c("Без антикоагуляции", "Другой") ~
+        "Другое / без антикоагуляции",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("Цитрат", "Гепарин", "Другое / без антикоагуляции"))
+  )
+
+pt_anticoag_t0 <- pt_top %>%
+  inner_join(ha1_anticoagulation, by = "pat_record_id") %>%
+  filter(!is.na(HA_anticoagulation_cat))
+
+tbl_baseline_anticoag <- pt_anticoag_t0 %>%
+  select(HA_anticoagulation_cat, any_of(vars_t0_compare)) %>%
+  tbl_summary(
+    by = HA_anticoagulation_cat,
+    type = list(any_of(c(
+      "vasopressors_if_used", "RRT_if_used", "MV_if_used",
+      "from_other_ICU_transfer", "SIC_positive"
+    )) ~ "dichotomous"),
+    value = list(any_of(c(
+      "vasopressors_if_used", "RRT_if_used", "MV_if_used",
+      "from_other_ICU_transfer", "SIC_positive"
+    )) ~ "Да"),
+    statistic = stat_t0,
+    label = lbl_t0_compare,
+    missing = "no"
+  ) %>%
+  add_n() %>%
+  add_p(test = list(all_continuous() ~ "kruskal.test", all_categorical() ~ "fisher.test")) %>%
+  modify_header(label ~ "**Показатель на T0**", all_stat_cols() ~ "**{level}**, N = {n}", p.value ~ "**p**") %>%
+  bold_labels()
+
+tbl_baseline_anticoag
+```
+
+## T0: INR <1.4 vs ≥1.4
+
+```{r}
+#| label: t0-inr
+
+pt_inr_t0 <- pt_top %>%
+  mutate(
+    INR_group = case_when(
+      INR < 1.4 ~ "МНО < 1.4",
+      INR >= 1.4 ~ "МНО ≥ 1.4",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("МНО < 1.4", "МНО ≥ 1.4"))
+  ) %>%
+  filter(!is.na(INR_group))
+
+vars_t0_compare_inr <- setdiff(vars_t0_compare, c("INR", "SIC_score", "SIC_positive"))
+
+tbl_baseline_inr_t0 <- pt_inr_t0 %>%
+  select(INR_group, any_of(vars_t0_compare_inr)) %>%
+  tbl_summary(
+    by = INR_group,
+    type = list(any_of(c("vasopressors_if_used", "RRT_if_used", "MV_if_used", "from_other_ICU_transfer")) ~ "dichotomous"),
+    value = list(any_of(c("vasopressors_if_used", "RRT_if_used", "MV_if_used", "from_other_ICU_transfer")) ~ "Да"),
+    statistic = stat_t0,
+    label = lbl_t0_compare[names(lbl_t0_compare) %in% vars_t0_compare_inr],
+    missing = "no"
+  ) %>%
+  add_n() %>%
+  add_p(test = list(all_continuous() ~ "wilcox.test", all_categorical() ~ "fisher.test")) %>%
+  modify_header(label ~ "**Показатель на T0**", all_stat_cols() ~ "**{level}**, N = {n}", p.value ~ "**p**") %>%
+  bold_labels()
+
+tbl_baseline_inr_t0
+```
+
+## Export
+
+```{r}
+#| label: export-subgroup-tables
+
+format_word_table <- function(x) {
+  x %>%
+    as_flex_table() %>%
+    flextable::fontsize(size = 8, part = "all") %>%
+    flextable::padding(padding = 2, part = "all") %>%
+    flextable::autofit() %>%
+    flextable::set_table_properties(layout = "autofit", width = 1)
+}
+
+word_landscape_section <- officer::prop_section(
+  page_size = officer::page_size(orient = "landscape"),
+  page_margins = officer::page_mar(
+    top = 0.4,
+    bottom = 0.4,
+    left = 0.4,
+    right = 0.4
+  )
+)
+
+flextable::save_as_docx(
+  "Ранняя vs поздняя ГС, landmark-популяция" = format_word_table(tbl_baseline_landmark_sorption),
+  "Перевод из другого ОРИТ" = format_word_table(tbl_baseline_transfer),
+  "Тип антикоагуляции" = format_word_table(tbl_baseline_anticoag),
+  "МНО на T0" = format_word_table(tbl_baseline_inr_t0),
+  pr_section = word_landscape_section,
+  path = file.path(TABLES_DIR, "baseline_comparison_tables.docx")
+)
+```
