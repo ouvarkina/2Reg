@@ -1197,6 +1197,69 @@ if (all(c("thrombocytes", "INR", "SOFA") %in% names(patients_tidy))) {
     )
 }
 
+# Сердечно-сосудистая субшкала SOFA (cv_sofa, 0-4) и SOFA без неё (SOFA_noCV).
+#
+# балSOFA в реестре приходит уже агрегированным по всем органным системам,
+# без разбивки на дыхательную/печёночную/почечную/ЦНС/гематологическую/
+# сердечно-сосудистую компоненты. Чтобы использовать SOFA как компонент
+# составной шкалы наряду с VIS2020 (который сам частично основан на дозах
+# вазопрессоров) без двойного учёта одной и той же информации,
+# восстанавливаем сердечно-сосудистую субшкалу по стандартным критериям
+# (Vincent et al. 1996) на основе среднего АД и доз норадреналина/
+# дофамина/добутамина/адреналина:
+#   4 = дофамин >15, или адреналин >0.1, или норадреналин >0.1 (мкг/кг/мин);
+#   3 = дофамин 5.1-15, или адреналин <=0.1, или норадреналин <=0.1;
+#   2 = дофамин <=5, или добутамин (любая доза);
+#   1 = среднее АД <70 мм рт. ст. без вазопрессоров;
+#   0 = среднее АД >=70 без вазопрессоров.
+#
+# Ограничения:
+# - вазопрессин, фенилэфрин, милринон, левосимендан не входят в оригинальные
+#   критерии 1996 года — пациенты только на этих препаратах могут получить
+#   заниженный cv_sofa;
+# - если и среднее АД, и все дозы отсутствуют одновременно — cv_sofa = NA
+#   (а не 0), чтобы не выдавать отсутствие данных за отсутствие поддержки.
+#
+# SOFA_noCV = SOFA - cv_sofa, ограничено снизу нулём.
+if (all(c("SOFA", "avg_BP", "vaso_norepinephrine", "vaso_dopamine",
+          "vaso_dobutamine", "vaso_epinephrine") %in% names(patients_tidy))) {
+  patients_tidy <- patients_tidy %>%
+    dplyr::mutate(
+      .vaso_all_na = is.na(avg_BP) & is.na(vaso_norepinephrine) &
+        is.na(vaso_dopamine) & is.na(vaso_dobutamine) & is.na(vaso_epinephrine),
+      .nor = dplyr::coalesce(vaso_norepinephrine, 0),
+      .dop = dplyr::coalesce(vaso_dopamine, 0),
+      .dob = dplyr::coalesce(vaso_dobutamine, 0),
+      .epi = dplyr::coalesce(vaso_epinephrine, 0),
+      cv_sofa = dplyr::case_when(
+        .vaso_all_na ~ NA_real_,
+        .dop > 15 | .epi > 0.1 | .nor > 0.1 ~ 4,
+        (.dop > 5 & .dop <= 15) | (.epi > 0 & .epi <= 0.1) | (.nor > 0 & .nor <= 0.1) ~ 3,
+        (.dop > 0 & .dop <= 5) | .dob > 0 ~ 2,
+        !is.na(avg_BP) & avg_BP < 70 ~ 1,
+        !is.na(avg_BP) & avg_BP >= 70 ~ 0,
+        TRUE ~ NA_real_
+      ),
+      SOFA_noCV = dplyr::if_else(
+        !is.na(SOFA) & !is.na(cv_sofa),
+        pmax(SOFA - cv_sofa, 0),
+        NA_real_
+      )
+    ) %>%
+    dplyr::select(-.vaso_all_na, -.nor, -.dop, -.dob, -.epi)
+
+  cat("\ncv_sofa distribution:\n")
+  print(table(patients_tidy$cv_sofa, useNA = "always"))
+  cat(
+    "n on non-classic vasoactive agents only (vasopressin/phenylephrine/",
+    "milrinone/levosimendan) at rows with cv_sofa computed: see vaso_* not covered above\n",
+    sep = ""
+  )
+} else {
+  patients_tidy <- patients_tidy %>%
+    mutate(cv_sofa = NA_real_, SOFA_noCV = NA_real_)
+}
+
 # Единая колонка бактериальной флоры по грам-окраске + бинарные индикаторы по каждому посеву:
 patients_tidy$gram_any_bin <- NA_integer_
 patients_tidy$gram_score <- NA_integer_

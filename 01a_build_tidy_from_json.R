@@ -510,6 +510,16 @@ extract_patient_rows <- function(pat_record_id, record_author, organization, cre
       VIS2020 = num0(pluck0(cl, "индексVIS2020", .default = NA)),
       avg_BP  = num0(pluck0(cl, "среднееАД", .default = NA)),
       INR     = num0(pluck0(cl, "МНО", .default = NA)),
+
+      # Дозы вазопрессоров/инотропов (мкг/кг/мин; вазопрессин — ЕД/кг/мин),
+      # использованные при расчёте индексVIS2020. Извлекаются отдельно,
+      # т.к. балSOFA приходит уже агрегированным, без разбивки по органным
+      # системам — эти дозы нужны, чтобы отдельно оценить вклад
+      # сердечно-сосудистой системы (см. cv_sofa в 01b).
+      vaso_norepinephrine = num0(pluck0(cl, "vis2020Params", "norepinephrine", .default = NA)),
+      vaso_dopamine       = num0(pluck0(cl, "vis2020Params", "dopamine", .default = NA)),
+      vaso_dobutamine     = num0(pluck0(cl, "vis2020Params", "dobutamine", .default = NA)),
+      vaso_epinephrine    = num0(pluck0(cl, "vis2020Params", "epinephrine", .default = NA)),
       FiO2 = FiO2_raw,
       PaO2 = PaO2_raw,
       SpO2 = SpO2_raw,
