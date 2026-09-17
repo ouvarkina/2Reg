@@ -765,7 +765,9 @@ HA_tidy <- purrr::pmap_dfr(
 ) %>%
   mutate(
     HA_avg_blood_flow = to_num(HA_avg_blood_flow),
-    HA_duration = round(dur_to_hours(HA_duration), 2)
+    # Сохраняем строку JSON (ЧЧ:ММ) до перевода в десятичные часы.
+    HA_duration_raw = as.character(HA_duration),
+    HA_duration = round(dur_to_hours(HA_duration_raw), 2)
   )
 
 # Жёсткий QC: если процедуры есть, но дата старта не извлечена ни разу,

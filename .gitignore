@@ -2,6 +2,8 @@
 data/*.json
 data/*.rds
 data/*.xlsx
+*.xlsx
+!data/2Reg_Dictionary_tidy.xlsx
 
 # generated outputs
 tables/*

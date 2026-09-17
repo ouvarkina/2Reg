@@ -30,6 +30,15 @@ Google-таблица Dictionary — правила для baseline-rank и гр
 #| include: false
 #| cache: false
 
+# Загружаем библиотеки и общие вспомогательные функции проекта.
+# Определяем папки для входных и выходных данных и создаём их при необходимости.
+# Читаем финальный ETL-датасет patients_tidy.
+#
+# Baseline для расчёта severity index — зарегистрированная точка m12h_0h.
+# Метод коррекции весов за избыточность — сумма квадратов попарных корреляций.
+# Правила включения переменных, референсные значения и сила ассоциации
+# далее читаются из Google Dictionary.
+
 suppressPackageStartupMessages({
   library(dplyr)
   library(tidyr)
@@ -70,12 +79,28 @@ to_num <- num_from_any
 
 ```{r}
 #| label: baseline-severity-ranks
+
+# Проверяем, что в patients_tidy есть минимально необходимые поля:
+# идентификатор пациента и timepoint.
+# При отсутствии этих полей расчёт прекращается.
+
 required_rank_cols <- c("pat_record_id", "timepoint")
 missing_rank_cols <- setdiff(required_rank_cols, names(patients_tidy))
 if (length(missing_rank_cols) > 0) {
   stop("Для расчета baseline ranks в patients_tidy нет колонок: ",
        paste(missing_rank_cols, collapse = ", "))
 }
+
+# Вспомогательные функции приводят значения из Dictionary и patients_tidy
+# к единому виду перед сравнением:
+# - убирают лишние пробелы;
+# - переводят пустые строки в NA;
+# - приводят текстовые категории к нижнему регистру;
+# - удаляют пояснения в скобках;
+# - позволяют задавать несколько референсных категорий через "|".
+#
+# Это нужно, чтобы, например, "Нет", " нет " и "НЕТ"
+# интерпретировались одинаково.
 
 clean_text_rank <- function(x) {
   x <- as.character(x)
@@ -114,6 +139,10 @@ is_reference_level_rank <- function(value, reference_levels) {
   value %in% strsplit(reference_levels, "|", fixed = TRUE)[[1]]
 }
 
+# Отдельно определяем категории, которые означают отсутствие клинической
+# информации ("нет данных", "неизвестно", "не оценивалось" и т.п.).
+# Они далее получают NA, а не ранг тяжести 0 или 1.
+
 is_nonclinical_category_rank <- function(value) {
   value %in% c(
     "n/a", "na", "неизвестно", "нет данных",
@@ -121,6 +150,18 @@ is_nonclinical_category_rank <- function(value) {
     "посев не проводился", "unknown", "missing"
   )
 }
+
+# Преобразуем референс для числовой переменной из текста Dictionary
+# в формальное правило расчёта расстояния от оптимума.
+#
+# Если найдено одно число:
+#   например "0" -> optimum = 0 ("center").
+#
+# Если найдены два числа:
+#   например "35–50" -> оптимальным считается весь интервал 35–50.
+#
+# Эти правила далее используются для перевода исходных значений
+# разных показателей в единую концепцию "расстояния от оптимума".
 
 parse_numeric_reference_rank <- function(x) {
   empty_rule <- function() {
@@ -166,6 +207,13 @@ parse_numeric_reference_rank <- function(x) {
   empty_rule()
 }
 
+# Читаем Google Dictionary, который задаёт конфигурацию severity index.
+# Из него берутся:
+# - какие переменные включать;
+# - тип переменной;
+# - референсный уровень / уровень наименьшего риска;
+# - заданная сила ассоциации.
+
 options(gargle_oauth_cache = TRUE)
 googlesheets4::gs4_auth(email = TRUE, scopes = "spreadsheets.readonly")
 
@@ -174,6 +222,10 @@ dictionary_raw <- googlesheets4::read_sheet(
   sheet = dictionary_sheet,
   na = c("", "NA", "N/A")
 )
+
+# Проверяем структуру Dictionary.
+# Если отсутствует хотя бы одно поле, необходимое для построения индекса,
+# расчёт прекращается, чтобы не использовать неполные правила.
 
 required_dictionary_columns <- c(
   "Название",
@@ -191,6 +243,16 @@ if (length(missing_dictionary_columns) > 0) {
   stop("В Google Dictionary отсутствуют колонки: ",
        paste(missing_dictionary_columns, collapse = ", "))
 }
+
+# Отбираем из Dictionary кандидатов для baseline severity index.
+#
+# В расчёт включаются только переменные:
+# - относящиеся к baseline;
+# - типа numeric, binary или factor;
+# - явно отмеченные "Включать в baseline_rank_vars = Да".
+#
+# Для каждой переменной сохраняем её референсное значение
+# и заданную в Dictionary силу ассоциации.
 
 baseline_candidates <- dictionary_raw %>%
   dplyr::transmute(
@@ -216,6 +278,12 @@ if (nrow(baseline_candidates) == 0L) {
   stop("В Dictionary нет baseline-переменных с `Включать в baseline_rank_vars = Да`.")
 }
 
+# Проверяем заданную силу ассоциации.
+# Для каждой включённой переменной она должна быть числом >= 0.
+# Позже этот коэффициент будет напрямую участвовать в расчёте веса:
+# чем выше association_strength, тем больший потенциальный вклад
+# переменная получает в severity index.
+
 invalid_association_strength <- baseline_candidates %>%
   dplyr::filter(
     is.na(association_strength) |
@@ -230,6 +298,9 @@ if (nrow(invalid_association_strength) > 0L) {
   )
 }
 
+# Проверяем, что каждая переменная имеет только одно правило в Dictionary.
+# Дубли сделали бы выбор референса и веса неоднозначным.
+
 if (anyDuplicated(baseline_candidates$variable) > 0L) {
   stop(
     "В Dictionary есть дублирующиеся baseline rank rules для: ",
@@ -240,6 +311,18 @@ if (anyDuplicated(baseline_candidates$variable) > 0L) {
 numeric_rules <- dplyr::bind_rows(
   lapply(baseline_candidates$optimum_reference, parse_numeric_reference_rank)
 )
+
+# Преобразуем текстовые правила Dictionary в формальные правила ранжирования.
+#
+# Для numeric:
+# - одно референсное число -> оптимальный центр;
+# - два числа -> оптимальный интервал.
+#
+# Для binary/factor:
+# - сохраняется референсная категория (или несколько категорий).
+#
+# Одновременно проверяем, что каждая указанная переменная
+# действительно существует в patients_tidy.
 
 rank_rules <- baseline_candidates %>%
   dplyr::bind_cols(numeric_rules) %>%
@@ -274,6 +357,14 @@ if (nrow(invalid_rank_rules) > 0L) {
   )
 }
 
+# SOFA и VIS2020 считаются обязательными компонентами baseline severity index.
+# Для обоих ожидается:
+# - numeric тип;
+# - оптимальное значение = 0.
+#
+# Это защищает от случайного исключения этих показателей
+# или неправильного задания направления тяжести в Dictionary.
+
 mandatory_rank_vars <- c("SOFA", "VIS2020")
 missing_mandatory_ranks <- setdiff(mandatory_rank_vars, rank_rules$variable)
 if (length(missing_mandatory_ranks) > 0L) {
@@ -289,6 +380,13 @@ mandatory_bad_reference <- rank_rules %>%
 if (nrow(mandatory_bad_reference) > 0L) {
   stop("Для SOFA и VIS2020 ожидается numeric reference = 0 в Dictionary.")
 }
+
+# Оставляем только исходную точку m12h_0h:
+# все компоненты severity index должны характеризовать одного пациента
+# в одном и том же baseline-состоянии.
+#
+# Дополнительно проверяем, что на каждого пациента приходится
+# не более одной baseline-строки.
 
 patients_baseline_for_ranks <- patients_tidy %>%
   dplyr::filter(timepoint == baseline_timepoint_for_ranks, !is.na(pat_record_id))
@@ -306,6 +404,13 @@ if (nrow(duplicate_rank_ids) > 0L) {
     paste(head(duplicate_rank_ids$pat_record_id, 10L), collapse = ", ")
   )
 }
+
+# Переводим baseline-показатели в long-format:
+# одна строка = один пациент × одна переменная.
+#
+# К каждому наблюдаемому значению присоединяем его правило из Dictionary.
+# Такой формат позволяет одинаково обработать все компоненты индекса,
+# несмотря на разные исходные единицы измерения и типы данных.
 
 baseline_rank_long <- patients_baseline_for_ranks %>%
   dplyr::select(pat_record_id, dplyr::all_of(rank_rules$variable)) %>%
@@ -326,6 +431,23 @@ baseline_rank_long <- patients_baseline_for_ranks %>%
       category_value,
       reference_levels
     ),
+# Для каждого значения рассчитываем расстояние от заданного оптимума.
+#
+# Numeric с оптимальным интервалом:
+# - внутри интервала distance = 0;
+# - вне интервала distance = расстояние до ближайшей границы.
+#
+# Numeric с одним оптимальным значением:
+# - distance = абсолютное отклонение от оптимума.
+#
+# Binary/factor:
+# - референсная категория -> 0;
+# - любая другая клиническая категория -> 1;
+# - отсутствие/неизвестность данных -> NA.
+#
+# Поэтому после этого шага для всех переменных выполняется единая логика:
+# 0 = оптимальное состояние,
+# большее значение = большее отклонение от оптимума.
 
     distance_to_optimum = dplyr::case_when(
       data_type == "numeric" & is.na(numeric_value) ~ NA_real_,
@@ -350,7 +472,16 @@ baseline_rank_long <- patients_baseline_for_ranks %>%
     )
   ) %>%
 
-  # Raw rank: 0 = optimum, larger rank = greater severity
+  # Внутри каждой переменной ранжируем положительные расстояния от оптимума.
+#
+# Оптимальное значение всегда получает raw rank = 0.
+# Остальные значения получают dense rank:
+# одинаковое расстояние -> одинаковый ранг,
+# большее расстояние -> больший ранг.
+#
+# Таким образом, далее используется порядок тяжести,
+# а не абсолютная величина лабораторного/клинического показателя.
+  
   dplyr::group_by(variable) %>%
   dplyr::mutate(
     severity_rank_raw = dplyr::case_when(
@@ -375,9 +506,16 @@ baseline_rank_long <- patients_baseline_for_ranks %>%
       max(severity_rank_raw, na.rm = TRUE)
     },
 
-    # Normalized severity rank:
-    # 0 = optimum
-    # 1 = maximum observed severity for this variable
+# Нормируем raw ranks отдельно для каждой переменной на диапазон 0–1:
+#
+#   severity_rank = raw_rank / maximum_observed_raw_rank
+#
+# 0 = заданный оптимум;
+# 1 = максимальная наблюдаемая тяжесть по этой переменной в данной когорте.
+#
+# Это необходимо, чтобы переменные с большим числом уникальных значений
+# не получали автоматически больший вклад, чем бинарные или
+# малодискретные переменные.
     severity_rank = dplyr::case_when(
       is.na(severity_rank_raw) ~ NA_real_,
       is.na(max_severity_rank) ~ NA_real_,
@@ -386,6 +524,13 @@ baseline_rank_long <- patients_baseline_for_ranks %>%
     )
   ) %>%
   dplyr::ungroup()
+
+# Создаём wide-версию нормированных severity ranks:
+# одна строка = пациент,
+# одна колонка = нормированный rank отдельной переменной.
+#
+# Эта таблица сохраняется как технический результат;
+# для расчёта корреляционной избыточности ниже создаётся аналогичная матрица.
 
 baseline_rank_wide <- baseline_rank_long %>%
   dplyr::select(pat_record_id, variable, severity_rank) %>%
@@ -396,29 +541,29 @@ baseline_rank_wide <- baseline_rank_long %>%
   )
 
 # 13c. Redundancy weights and composite baseline severity index ---------
+# Оцениваем, насколько каждый компонент severity index дублирует
+# информацию других компонентов.
 #
-# Корреляции считаем между самими severity ranks, потому что именно эти
-# преобразованные компоненты затем суммируются в итоговом индексе.
-# Pearson correlation между уже ранжированными значениями оценивает
-# линейную связь на шкале рангов; знак не влияет, так как r возводится
-# в квадрат.
+# Сначала рассчитываем попарные Pearson correlations между
+# нормированными severity ranks.
 #
-# Полуэвристический вес независимой информации:
-#   independent_information_j = 1 / sum_k(r_jk^2)
-# Диагональ r_jj = 1 включена.
+# Для переменной j:
+#   redundancy_j = sum_k(r_jk^2)
+#   independent_information_j = 1 / redundancy_j
 #
-# Итоговый вес переменной:
-#   composite_weight_j = independent_information_j * association_strength_j
+# Собственная корреляция r_jj = 1 входит в сумму.
+# Поэтому максимально независимая переменная имеет
+# independent_information = 1, а корреляции с другими компонентами
+# уменьшают этот коэффициент.
 #
-# Нормированный вес переменной:
-#   normalized_weight_j = composite_weight_j / sum_j(composite_weight_j)
+# Затем независимая информация объединяется с заданной
+# в Dictionary силой ассоциации:
 #
-# Итоговый индекс пациента — средневзвешенный severity rank
-# среди доступных у пациента компонентов:
-#   baseline_severity_index_i =
-#     sum_j(severity_rank_ij * normalized_weight_j) /
-#     sum_j(normalized_weight_j),
-# где в знаменатель входят только наблюдаемые компоненты.
+#   composite_weight =
+#     association_strength * independent_information
+#
+# Полученные веса нормируются до суммы 1 и используются
+# при расчёте patient-level severity index.
 
 if (!identical(baseline_redundancy_method, "row_sum_r2")) {
   stop(
@@ -426,6 +571,10 @@ if (!identical(baseline_redundancy_method, "row_sum_r2")) {
     baseline_redundancy_method
   )
 }
+
+# Формируем матрицу нормированных severity ranks:
+# строки = пациенты, колонки = компоненты индекса.
+# Она используется только для оценки корреляций и избыточности компонентов.
 
 baseline_rank_matrix <- baseline_rank_long %>%
   dplyr::select(pat_record_id, variable, severity_rank) %>%
@@ -437,6 +586,15 @@ baseline_rank_matrix <- baseline_rank_long %>%
     pat_record_id,
     dplyr::all_of(rank_rules$variable)
   )
+
+# Проверяем, достаточно ли данных для оценки корреляционной избыточности.
+#
+# Переменная участвует в расчёте redundancy, если:
+# - есть как минимум 3 наблюдения;
+# - есть как минимум 2 различных наблюдаемых значения.
+#
+# Константные или практически отсутствующие переменные
+# нельзя содержательно использовать для корреляционного расчёта.
 
 rank_variable_qc <- tibble::tibble(
   variable = rank_rules$variable,
@@ -458,6 +616,13 @@ rank_variable_qc <- tibble::tibble(
 usable_rank_variables <- rank_variable_qc %>%
   dplyr::filter(usable_for_redundancy) %>%
   dplyr::pull(variable)
+
+# Заранее создаём полные матрицы для:
+# - попарных корреляций severity ranks;
+# - числа пациентов, доступных для каждой пары переменных.
+#
+# Для переменных, для которых корреляцию оценить нельзя,
+# в итоговой матрице остаётся NA.
 
 baseline_rank_cor_matrix <- matrix(
   NA_real_,
@@ -508,6 +673,17 @@ if (length(usable_rank_variables) > 0L) {
   ] <- pairwise_n_usable
 }
 
+# Для каждой переменной суммируем квадраты всех доступных
+# попарных корреляций:
+#
+#   redundancy_denominator = sum(r^2)
+#
+# Знак связи не важен: и положительное, и отрицательное
+# дублирование информации увеличивает redundancy.
+#
+# Чем сильнее переменная связана с другими компонентами,
+# тем больше denominator и тем меньший независимый вес она получит.
+
 redundancy_denominator <- rep(NA_real_, nrow(rank_rules))
 names(redundancy_denominator) <- rank_rules$variable
 
@@ -521,6 +697,22 @@ if (length(usable_rank_variables) > 0L) {
     na.rm = TRUE
   )
 }
+
+# Рассчитываем окончательный вес каждого компонента severity index.
+#
+# 1. independent_information = 1 / sum(r^2)
+#    уменьшает вес признаков, которые сильно дублируют остальные.
+#
+# 2. composite_weight =
+#      association_strength * independent_information
+#    одновременно учитывает заданную клиническую/литературную
+#    силу ассоциации и корреляционную независимость признака.
+#
+# 3. composite_weight_normalized
+#    переводит веса так, чтобы их сумма по всем компонентам была равна 1.
+#
+# Нормировка не меняет относительное соотношение весов,
+# но позволяет интерпретировать их как доли общего веса индекса.
 
 baseline_redundancy_weights <- rank_rules %>%
   dplyr::select(
@@ -554,6 +746,11 @@ baseline_redundancy_weights <- rank_rules %>%
       rep(NA_real_, dplyr::n())
     }
   )
+# Сохраняем контрольные характеристики системы весов:
+# - суммарный нормированный вес (в норме = 1);
+# - число компонентов с ненулевым весом.
+#
+# Они далее используются при расчёте coverage пациента.
 
 total_normalized_weight <- sum(
   baseline_redundancy_weights$composite_weight_normalized,
@@ -599,6 +796,21 @@ baseline_severity_contributions <- baseline_rank_long %>%
     )
   )
 
+# Суммируем вклады компонентов отдельно для каждого пациента.
+#
+# Итоговый severity index — взвешенное среднее среди доступных компонентов:
+#
+#   severity_index =
+#     sum(severity_rank * weight) /
+#     sum(weight of observed components)
+#
+# Поэтому пропуски не уменьшают индекс искусственно:
+# если компонент отсутствует, из расчёта исключается и его вклад,
+# и его вес.
+#
+# Индекс находится на шкале 0–1:
+# большее значение соответствует большей относительной baseline-тяжести.
+
 baseline_severity_by_patient <-
   baseline_severity_contributions %>%
   dplyr::group_by(pat_record_id) %>%
@@ -630,7 +842,11 @@ baseline_severity_by_patient <-
 
     baseline_severity_weight_total =
       total_normalized_weight,
-
+# Coverage показывает, какая доля общего веса индекса
+# была фактически представлена наблюдаемыми данными пациента.
+#
+# Например coverage = 0.90 означает, что расчёт severity index
+# основан на компонентах, составляющих 90% общего потенциального веса.
     baseline_severity_coverage = dplyr::if_else(
       total_normalized_weight > 0,
       baseline_severity_weight_observed /
@@ -646,14 +862,21 @@ baseline_severity_by_patient <-
 
 # Build numeric outcome (`outcome_propensity`)
 
-This block reproduces the old numeric outcome calculation from the previous correlation-analysis code.
-
-The original ordering is preserved:
-
-**early death < late death < continues in ICU / transferred < late discharge < early discharge**.
-
 ```{r}
 #| label: old-numeric-outcome
+
+# Строим отдельный числовой показатель исхода.
+# Он НЕ участвует в расчёте baseline severity index.
+#
+# Шкала сохраняет заданный ранее порядок исходов:
+#
+#   ранняя смерть
+#   < поздняя смерть
+#   < продолжает лечение / переведён
+#   < поздняя выписка
+#   < ранняя выписка
+#
+# Поэтому большее outcome_propensity означает более благоприятный исход.
 
 required_outcome_cols <- c(
   "pat_record_id",
@@ -677,6 +900,10 @@ outcome_propensity_by_patient <- patients_tidy %>%
   dplyr::arrange(pat_record_id) %>%
   dplyr::distinct(pat_record_id, .keep_all = TRUE)
 
+# Находим максимальные наблюдавшиеся сроки смерти и выписки.
+# Они нужны для разнесения разных категорий исхода
+# по одной непрерывной числовой шкале без их пересечения.
+
 max_death_day <- outcome_propensity_by_patient %>%
   dplyr::filter(clean_chr(outcome) == "умер") %>%
   dplyr::summarise(value = max(outcome_days, na.rm = TRUE)) %>%
@@ -690,8 +917,26 @@ max_discharge_day <- outcome_propensity_by_patient %>%
 if (!is.finite(max_death_day)) max_death_day <- 0
 if (!is.finite(max_discharge_day)) max_discharge_day <- 0
 
+# Создаём смещение шкалы так, чтобы:
+# - все значения для умерших находились ниже;
+# - продолжающие лечение / переведённые занимали промежуточное положение;
+# - выписанные находились выше.
+
 outcome_score_shift <- max_death_day + max_discharge_day + 2
 outcome_continues_score <- max_death_day + 1
+
+# Присваиваем patient-level outcome score:
+#
+# death:
+#   score = время до смерти
+#   -> более поздняя смерть получает более высокий score.
+#
+# discharge:
+#   score = shift - время до выписки
+#   -> более ранняя выписка получает более высокий score.
+#
+# continues/transferred:
+#   получают фиксированный промежуточный score.
 
 outcome_propensity_by_patient <- outcome_propensity_by_patient %>%
   dplyr::mutate(
@@ -714,14 +959,29 @@ outcome_propensity_by_patient <- outcome_propensity_by_patient %>%
 
 # Outcome adjusted for baseline severity
 
-`outcome_adj` is the residual from the linear regression
-`outcome_propensity ~ baseline_severity_index`. Because larger
-`outcome_propensity` means a better observed outcome, positive residuals mean
-a better-than-expected outcome for the patient's baseline severity, and
-negative residuals mean a worse-than-expected outcome.
-
 ```{r}
 #| label: outcome-adjusted-for-severity
+
+# Оцениваем, насколько фактический outcome пациента лучше или хуже
+# ожидаемого исхода при его baseline severity.
+#
+# Сначала присоединяем baseline_severity_index к outcome_propensity.
+# Затем на пациентах с обоими показателями строим линейную модель:
+#
+#   outcome_propensity ~ baseline_severity_index
+#
+# Модель переводит baseline severity в ожидаемое значение
+# на той же шкале, что и outcome_propensity.
+#
+# Для каждого пациента:
+#
+#   outcome_adj =
+#     observed outcome_propensity -
+#     expected outcome_propensity
+#
+# outcome_adj > 0 -> исход лучше ожидаемого для данной тяжести;
+# outcome_adj < 0 -> исход хуже ожидаемого;
+# outcome_adj ≈ 0 -> исход близок к ожидаемому.
 
 outcome_propensity_by_patient <- outcome_propensity_by_patient %>%
   dplyr::left_join(
@@ -762,6 +1022,19 @@ outcome_propensity_by_patient <- outcome_propensity_by_patient %>%
 ```{r}
 #| label: save-baseline-severity
 
+# Собираем полный технический результат расчёта severity index.
+#
+# RDS сохраняет:
+# - правила ранжирования;
+# - raw и normalized ranks;
+# - QC переменных;
+# - корреляционную матрицу и pairwise N;
+# - рассчитанные веса;
+# - patient-level severity index.
+#
+# Эти объекты предназначены для воспроизводимости,
+# проверки расчёта и использования в последующих анализах.
+
 baseline_severity_results <- list(
   rank_rules = rank_rules,
   baseline_rank_long = baseline_rank_long,
@@ -773,6 +1046,11 @@ baseline_severity_results <- list(
   patient_index = baseline_severity_by_patient
 )
 
+# Для Excel оставляем только компактную таблицу,
+# необходимую для содержательной проверки весов:
+# переменная, название, сила ассоциации,
+# независимая информация и окончательный нормированный вес.
+
 weights_out <- baseline_redundancy_weights %>%
   dplyr::select(
     variable,
@@ -781,6 +1059,9 @@ weights_out <- baseline_redundancy_weights %>%
     independent_information,
     composite_weight_normalized
   )
+
+# Отдельный Excel-лист содержит итоговый severity index пациента
+# и coverage, показывающий полноту данных, на которых он рассчитан.
 
 patient_index_out <- baseline_severity_by_patient %>%
   dplyr::select(
@@ -798,6 +1079,10 @@ openxlsx::write.xlsx(
   asTable = TRUE,
   overwrite = TRUE
 )
+
+# В человекочитаемую outcome-таблицу сохраняем:
+# исход, его числовой score, baseline severity,
+# ожидаемый по severity outcome и residual outcome_adj.
 
 outcome_propensity_out <- outcome_propensity_by_patient %>%
   dplyr::select(
@@ -817,6 +1102,10 @@ openxlsx::write.xlsx(
   overwrite = TRUE
 )
 
+# Сохраняем полные machine-readable RDS для последующих анализов.
+# В отличие от Excel, они содержат все технические объекты
+# без сокращения информации.
+
 saveRDS(
   baseline_severity_results,
   file.path(ANALYSIS_DATA_DIR, "baseline_severity_results.rds")
@@ -831,6 +1120,10 @@ saveRDS(
   outcome_propensity_by_patient,
   file.path(ANALYSIS_DATA_DIR, "outcome_propensity_by_patient.rds")
 )
+
+# Выводим краткий QC после успешного выполнения:
+# число компонентов индекса, число компонентов с ненулевым весом,
+# медианный coverage и основные параметры outcome-модели.
 
 cat("Baseline severity analysis saved.
 ")

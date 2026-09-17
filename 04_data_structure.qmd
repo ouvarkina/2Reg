@@ -1,5 +1,5 @@
 ---
-title: "2Reg — baseline data structure: correlations, PCA and heatmaps"
+title: "2Reg — baseline data structure: PCA and patient heatmap"
 format:
   html:
     toc: true
@@ -13,20 +13,23 @@ execute:
 
 # Входные данные и предварительные условия
 
-baseline_severity_index отображается на большой тепловой карте корреляций исходных показателей и на тепловых картах пациентов.
+Единственная heatmap: `baseline_patient_variable_heatmap_numeric_binary_percentile_manhattan`.
+Справа показан outcome score (`outcome_propensity`), слева — статус на 28-й день.
+Обе аннотации не участвуют в PCA или кластеризации.
 
 Необходимые входные данные:
 
-data/patients_tidy.rds;
-data/analysis/baseline_severity_by_patient.rds, создаваемый скриптом 03b_severity_and_numeric_outcome.qmd.
+- `data/patients_tidy.rds`;
+- `data/analysis/outcome_propensity_by_patient.rds` из `03b_severity_and_numeric_outcome.qmd`;
+- Google-таблица Dictionary для выбора исходных числовых переменных PCA.
 
-Дополнительный источник настроек:
-
-Google-таблица Dictionary, используемая для выбора исходных числовых переменных.
-
-Важно: baseline_severity_index представляет собой производный суммарный показатель, рассчитанный на основе исходных переменных. Поэтому он не используется в качестве входной переменной для PCA или кластеризации пациентов. Он добавляется только для визуального и диагностического сравнения с исходными переменными.
-
-Матрицы корреляций рассчитываются по очищенным исходным значениям после выборочного лог-преобразования и винзоризации, но до масштабирования. Для PCA и кластеризации пациентов используются те же подготовленные значения после масштабирования. На диаграммах рассеяния PCA и тепловых картах рассчитанный на этапе ETL 28-дневный статус используется только как цветовая аннотация / аннотация строк: зелёный — подтверждено, что пациент жив, красный — смерть к 28-му дню, серый — статус неизвестен.
+PCA и отдельный анализ кластеров используют прежние подготовленные значения
+после лог-преобразования, импутации, винзоризации и масштабирования.
+Дополнительные показатели heatmap не расширяют набор PCA.
+`CRP_NLR` = СРБ (мг/л) / NLR на baseline; при NLR <= 0 или пропуске
+компонента результат отсутствует. Новые числовые столбцы heatmap переводятся
+в процентили по наблюдаемым значениям без заполнения пропусков.
+Отрицательное `antibiotics_to_HA1_hours` допустимо и сохраняется.
 
 # Setup
 
@@ -72,19 +75,26 @@ assert_columns(
   "patients_tidy"
 )
 
-severity_rds <- pick_path(c(
-  file.path(ANALYSIS_DATA_DIR, "baseline_severity_by_patient.rds"),
-  file.path("/mnt/data", ANALYSIS_DATA_DIR, "baseline_severity_by_patient.rds"),
-  "baseline_severity_by_patient.rds"
+outcome_score_rds <- pick_path(c(
+  file.path(ANALYSIS_DATA_DIR, "outcome_propensity_by_patient.rds"),
+  file.path("/mnt/data", ANALYSIS_DATA_DIR, "outcome_propensity_by_patient.rds"),
+  "outcome_propensity_by_patient.rds"
 ))
-
-baseline_severity_by_patient <- readRDS(severity_rds) %>%
-  select(
-    pat_record_id,
-    baseline_severity_index,
-    coverage = baseline_severity_coverage
-  ) %>%
-  distinct(pat_record_id, .keep_all = TRUE)
+outcome_score_by_patient <- readRDS(outcome_score_rds)
+assert_columns(outcome_score_by_patient, c("pat_record_id", "outcome_propensity"), "outcome score")
+outcome_score_by_patient <- outcome_score_by_patient %>%
+  select(pat_record_id, outcome_propensity)
+if (anyNA(outcome_score_by_patient$pat_record_id) ||
+    anyDuplicated(outcome_score_by_patient$pat_record_id)) {
+  stop("В outcome_propensity_by_patient отсутствуют ID или есть повторяющиеся ID.")
+}
+assert_columns(
+  patients_tidy,
+  c("ind_bin_sepsis", "ind_bin_rhabdomyolysis", "diag_bin_acute_pancreatitis",
+    "antibiotics_to_HA1_hours", "icu_to_HA1_hours", "CLI",
+    "C_react_protein", "C_react_protein_unit", "NLR", "is_pat_fungal"),
+  "patients_tidy: heatmap inputs"
+)
 ```
 
 # Baseline structure and PCA
@@ -184,7 +194,8 @@ baseline_binary_annotation_vars
 
 patients_baseline_structure <- patients_tidy %>%
   filter(timepoint == "m12h_0h", !is.na(pat_record_id)) %>%
-  left_join(baseline_severity_by_patient, by = "pat_record_id")
+  select(-any_of("outcome_propensity")) %>%
+  left_join(outcome_score_by_patient, by = "pat_record_id")
 
 duplicate_baseline_ids <- patients_baseline_structure %>%
   count(pat_record_id) %>%
@@ -208,8 +219,7 @@ baseline_structure_annotations <- patients_baseline_structure %>%
   transmute(
     pat_record_id,
     outcome,
-    baseline_severity_index,
-    severity_coverage = coverage,
+    outcome_propensity,
     outcome_logit = factor(outcome_logit, levels = c(0, 1)),
     outcome_28d_status = factor(
       outcome_28d_status,
@@ -231,7 +241,7 @@ patients_baseline_structure_annotated <- patients_baseline_structure %>%
   select(
     -any_of(c(
       "outcome", "outcome_logit", "outcome_28d_status",
-      "outcome_death_28d_bin", "baseline_severity_index", "coverage"
+      "outcome_death_28d_bin", "outcome_propensity"
     ))
   ) %>%
   left_join(baseline_structure_annotations, by = "pat_record_id")
@@ -659,85 +669,6 @@ structure_vars_used
 dim(X_scaled)
 ```
 
-## Коррелограмма переменных
-
-```{r}
-#| label: baseline-correlation-heatmap
-#| fig.width: 10
-#| fig.height: 9
-
-# Корреляции рассчитываем по очищенным и при необходимости log-преобразованным
-# baseline-показателям до стандартизации. Масштабирование оставляем только для PCA.
-cor_mat <- cor(
-  X,
-  use = "pairwise.complete.obs",
-  method = "pearson"
-)
-
-# Для кластеризации исходных переменных используем прежнее правило 1 - abs(r).
-cor_dist <- as.dist(1 - abs(cor_mat))
-cor_hclust <- hclust(cor_dist, method = "ward.D2")
-var_order <- cor_hclust$labels[cor_hclust$order]
-
-# Raw baseline severity index добавляем только для отображения и проверки корреляций.
-# Он НЕ участвует в построении PCA и НЕ меняет порядок исходных переменных.
-severity_for_structure <- baseline_structure_annotations %>%
-  select(pat_record_id, baseline_severity_index) %>%
-  filter(pat_record_id %in% rownames(X)) %>%
-  arrange(match(pat_record_id, rownames(X)))
-
-severity_vector <- severity_for_structure$baseline_severity_index
-
-if (length(severity_vector) != nrow(X)) {
-  stop("Severity index could not be aligned to all rows of the prepared correlation matrix.")
-}
-
-X_corr_display <- cbind(
-  X,
-  severity_index = severity_vector
-)
-
-cor_mat_display <- cor(
-  X_corr_display,
-  use = "pairwise.complete.obs",
-  method = "pearson"
-)
-
-# Сохраняем прежний hclust-порядок исходных переменных; severity ставим отдельно справа/снизу.
-var_order_display <- c(var_order, "severity_index")
-
-cor_long <- as.data.frame(as.table(cor_mat_display)) %>%
-  rename(
-    var1 = Var1,
-    var2 = Var2,
-    correlation = Freq
-  ) %>%
-  mutate(
-    var1 = factor(var1, levels = var_order_display),
-    var2 = factor(var2, levels = rev(var_order_display))
-  )
-
-ggplot(cor_long, aes(var1, var2, fill = correlation)) +
-  geom_tile() +
-  scale_fill_gradient2(
-    limits = c(-1, 1),
-    midpoint = 0,
-    name = "Pearson r"
-  ) +
-  coord_fixed() +
-  labs(
-    title = "Baseline numeric variables: correlation heatmap",
-    subtitle = "Severity index is shown for diagnostic comparison only; it is not used in PCA or clustering",
-    x = NULL,
-    y = NULL
-  ) +
-  theme_minimal(base_size = 10) +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    panel.grid = element_blank()
-  )
-```
-
 ## PCA
 
 ```{r}
@@ -948,79 +879,14 @@ pca_binary_annotation_summary
 
 # Heatmaps and clustering
 
-## Heatmap пациентов × переменных
-
-```{r}
-#| label: baseline-patient-variable-heatmap
-#| fig.width: 10
-#| fig.height: 10
-
-if (!requireNamespace("pheatmap", quietly = TRUE)) {
-  stop("Install pheatmap first: install.packages('pheatmap')")
-}
-
-annotation_row <- baseline_structure_annotations %>%
-  select(
-    pat_record_id,
-    any_of(c("outcome_28d_status", "baseline_severity_index"))
-  ) %>%
-  tibble::column_to_rownames("pat_record_id")
-
-annotation_row <- annotation_row[rownames(X_scaled), , drop = FALSE]
-
-# Отдельное ограничение цвета для читаемости heatmap.
-# Это не меняет PCA, только визуализацию.
-X_heatmap <- X_scaled
-X_heatmap[X_heatmap > 3] <- 3
-X_heatmap[X_heatmap < -3] <- -3
-
-p_baseline_heatmap <- pheatmap::pheatmap(
-  X_heatmap,
-  clustering_distance_rows = "euclidean",
-  clustering_method = "ward.D2",
-  clustering_distance_cols = cor_dist,
-  cluster_cols = cor_hclust,
-  annotation_row = annotation_row,
-  annotation_colors = list(outcome_28d_status = outcome_28d_colors),
-  show_rownames = FALSE,
-  fontsize_col = 9,
-  main = "Baseline patient × variable heatmap, z capped at ±3; severity shown as row annotation",
-  silent = TRUE
-)
-
-grid::grid.newpage()
-grid::grid.draw(p_baseline_heatmap$gtable)
-
-dir.create(GRAPHES_DIR, showWarnings = FALSE, recursive = TRUE)
-
-pdf(
-  file = file.path(GRAPHES_DIR, "baseline_patient_variable_heatmap.pdf"),
-  width = 10,
-  height = 10,
-  useDingbats = FALSE
-)
-grid::grid.draw(p_baseline_heatmap$gtable)
-dev.off()
-
-png(
-  filename = file.path(GRAPHES_DIR, "baseline_patient_variable_heatmap.png"),
-  width = 10,
-  height = 10,
-  units = "in",
-  res = 300
-)
-grid::grid.draw(p_baseline_heatmap$gtable)
-dev.off()
-```
-
-## Отдельная combined heatmap: numeric + binary baseline-показатели, percentile scale
+## Heatmap: numeric + binary baseline-показатели, percentile scale
 
 ```{r}
 #| label: baseline-combined-numeric-binary-heatmap
 #| fig.width: 12
 #| fig.height: 10
 
-# Это отдельная heatmap, где numeric baseline-показатели и бинарные
+# Единственная heatmap, где numeric baseline-показатели и бинарные
 # baseline-показатели показаны в общей шкале 0–1.
 #
 # Numeric-показатели:
@@ -1047,10 +913,9 @@ if (!requireNamespace("circlize", quietly = TRUE)) {
 
 baseline_binary_heatmap_vars <- intersect(
   c(
-    "ICU_6_month_history",
-    "is_bacteremic",
-    "is_pat_gram_plus",
-    "is_pat_gram_minus"
+    "ICU_6_month_history", "is_bacteremic", "is_pat_gram_plus", "is_pat_gram_minus",
+    "ind_bin_sepsis", "ind_bin_rhabdomyolysis", "diag_bin_acute_pancreatitis",
+    "is_pat_fungal"
   ),
   names(patients_baseline_structure)
 )
@@ -1092,7 +957,7 @@ to_binary01 <- function(x) {
 to_percentile01 <- function(x) {
   x <- as.numeric(x)
   out <- rep(NA_real_, length(x))
-  ok <- !is.na(x)
+  ok <- is.finite(x)
 
   if (sum(ok) == 0) {
     return(out)
@@ -1117,6 +982,38 @@ numeric_quantile_df <- baseline_numeric_matrix %>%
       all_of(structure_vars_used),
       to_percentile01
     )
+  )
+
+# Дополняем только heatmap. Уже включённые столбцы (в частности,
+# icu_to_HA1_hours) не дублируем и сохраняем их прежнюю обработку.
+heatmap_extra_numeric_vars <- c(
+  "antibiotics_to_HA1_hours", "icu_to_HA1_hours", "CLI", "CRP_NLR"
+)
+heatmap_extra_baseline <- patients_baseline_structure %>%
+  mutate(
+    .crp_unit = str_to_lower(str_replace_all(as.character(C_react_protein_unit), "\\s+", "")),
+    .crp_mgl = case_when(
+      .crp_unit %in% c("мг/л", "mg/l") ~ C_react_protein,
+      .crp_unit %in% c("мг/дл", "mg/dl") ~ C_react_protein * 10,
+      TRUE ~ NA_real_
+    ),
+    CRP_NLR = if_else(
+      is.finite(.crp_mgl) & .crp_mgl >= 0 & is.finite(NLR) & NLR > 0,
+      .crp_mgl / NLR, NA_real_
+    )
+  ) %>%
+  select(pat_record_id, all_of(heatmap_extra_numeric_vars))
+extra_vars_to_add <- setdiff(heatmap_extra_numeric_vars, names(numeric_quantile_df))
+heatmap_extra_numeric_qc <- heatmap_extra_baseline %>%
+  summarise(across(all_of(heatmap_extra_numeric_vars), ~ sum(is.finite(.x)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_observed")
+print(heatmap_extra_numeric_qc)
+numeric_quantile_df <- numeric_quantile_df %>%
+  left_join(
+    heatmap_extra_baseline %>%
+      select(pat_record_id, all_of(extra_vars_to_add)) %>%
+      mutate(across(all_of(extra_vars_to_add), to_percentile01)),
+    by = "pat_record_id"
   )
 
 numeric_quantile_mat <- numeric_quantile_df %>%
@@ -1210,7 +1107,7 @@ combined_col_hclust <- hclust(
 annotation_row_combined <- baseline_structure_annotations %>%
   select(
     pat_record_id,
-    any_of(c("outcome_28d_status", "baseline_severity_index"))
+    all_of(c("outcome_28d_status", "outcome_propensity"))
   )
 
 annotation_row_combined <- annotation_row_combined[
@@ -1222,25 +1119,33 @@ annotation_row_combined <- annotation_row_combined[
 outcome_28d_values <- annotation_row_combined$outcome_28d_status
 names(outcome_28d_values) <- annotation_row_combined$pat_record_id
 
-severity_values <- annotation_row_combined$baseline_severity_index
-names(severity_values) <- annotation_row_combined$pat_record_id
+outcome_score_values <- annotation_row_combined$outcome_propensity
+outcome_score_values[!is.finite(outcome_score_values)] <- NA_real_
+names(outcome_score_values) <- annotation_row_combined$pat_record_id
 
-severity_col_fun <- circlize::colorRamp2(
-  c(
-    min(severity_values, na.rm = TRUE),
-    median(severity_values, na.rm = TRUE),
-    max(severity_values, na.rm = TRUE)
-  ),
+# Цветовая шкала корректна также при постоянном или полностью пропущенном score.
+score_observed <- outcome_score_values[is.finite(outcome_score_values)]
+if (length(score_observed) == 0L) {
+  score_limits <- c(0, 1)
+} else {
+  score_limits <- range(score_observed)
+  if (diff(score_limits) == 0) score_limits <- score_limits + c(-0.5, 0.5)
+}
+outcome_score_col_fun <- circlize::colorRamp2(
+  c(score_limits[1], mean(score_limits), score_limits[2]),
   c("white", "grey70", "black")
 )
 
 row_ha <- ComplexHeatmap::rowAnnotation(
   outcome_28d_status = outcome_28d_values,
-  severity_index = severity_values,
-  col = list(
-    outcome_28d_status = outcome_28d_colors,
-    severity_index = severity_col_fun
-  ),
+  col = list(outcome_28d_status = outcome_28d_colors),
+  na_col = "grey85",
+  show_annotation_name = TRUE
+)
+row_ha_score <- ComplexHeatmap::rowAnnotation(
+  outcome_score = outcome_score_values,
+  col = list(outcome_score = outcome_score_col_fun),
+  na_col = "grey85",
   show_annotation_name = TRUE
 )
 
@@ -1259,13 +1164,14 @@ p_baseline_combined_heatmap <- ComplexHeatmap::Heatmap(
   cluster_columns = combined_col_hclust,
 
   left_annotation = row_ha,
+  right_annotation = row_ha_score,
   show_row_names = FALSE,
   show_column_names = TRUE,
   column_names_gp = grid::gpar(fontsize = 8),
   column_names_rot = 90,
 
   row_title = "Patients",
-  column_title = "Baseline variables: numeric percentiles + binary indicators; severity shown as row annotation",
+  column_title = "Baseline variables: numeric percentiles + binary indicators; outcome score shown on the right",
   rect_gp = grid::gpar(col = "grey85", lwd = 0.2)
 )
 
@@ -1379,10 +1285,13 @@ baseline_structure_results <- list(
   X_scaled_untrimmed = X_scaled_untrimmed,
   X_scaled = X_scaled,
   structure_vars_used = structure_vars_used,
-  cor_mat = cor_mat,
-  cor_mat_display = cor_mat_display,
-  cor_dist = cor_dist,
-  cor_hclust = cor_hclust,
+  heatmap_extra_numeric_qc = heatmap_extra_numeric_qc,
+  heatmap_extra_baseline = heatmap_extra_baseline,
+  baseline_binary_heatmap_qc = baseline_binary_heatmap_qc,
+  X_combined_heatmap = X_combined_heatmap,
+  annotation_row_combined = annotation_row_combined,
+  combined_row_hclust = combined_row_hclust,
+  combined_col_hclust = combined_col_hclust,
   pca_fit = pca_fit,
   pca_scores = pca_scores,
   pca_loadings = pca_loadings
@@ -1415,6 +1324,6 @@ saveRDS(
 cat("Data structure analysis saved.\n")
 cat("Patients in PCA/clustering:", nrow(X_scaled), "\n")
 cat("Original variables in PCA/clustering:", ncol(X_scaled), "\n")
-cat("Severity index shown in correlation/heatmap: yes\n")
-cat("Severity index used in PCA/clustering: no\n")
+cat("Heatmap: numeric_binary_percentile_manhattan only\n")
+cat("Outcome score (outcome_propensity): right annotation only, excluded from PCA/clustering\n")
 ```

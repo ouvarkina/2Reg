@@ -80,6 +80,70 @@ patients_tidy <- readRDS(patients_extracted_rds)
 HA_tidy <- readRDS(ha_extracted_rds)
 accepted_registry_ids <- readRDS(registry_ids_file)
 
+# 3a. Organ support duration: total hours and raw components --------------
+# В JSON общаяДлительность содержит компоненты, а не две альтернативные меры:
+# ОбщаяДлительностьСуток + ОбщаяДлительностьЧасов.
+# 01a извлекает их в *_dur_days и *_dur_hours. До пересчёта сохраняем *_raw.
+# Итог: *_dur_hours = 24 * days_raw + hours_raw; *_dur_days = hours / 24.
+# Не используем разность дат начала/окончания: поддержка могла прерываться.
+# Пропуск компонента не заменяем нулём. Отсутствие обеих частей также даёт NA.
+# При days_raw = 0 и hours_raw >= 24 полное время однозначно (например, 32 ч).
+# При days_raw > 0 и hours_raw >= 24 смысл часов неоднозначен: итог NA до QC.
+# HA_duration — отдельное поле ЧЧ:ММ, к этой коррекции не относится.
+support_duration_total <- function(days_raw, hours_raw) {
+  duration_qc <- dplyr::case_when(
+    is.na(days_raw) & is.na(hours_raw) ~ "missing",
+    is.na(days_raw) | is.na(hours_raw) ~ "incomplete",
+    !is.finite(days_raw) | !is.finite(hours_raw) |
+      days_raw < 0 | hours_raw < 0 | days_raw != floor(days_raw) ~ "invalid",
+    days_raw > 0 & hours_raw >= 24 ~ "ambiguous_hours_ge24",
+    days_raw == 0 & hours_raw >= 24 ~ "hours_ge24_days_zero",
+    TRUE ~ "ok"
+  )
+  total_hours <- dplyr::if_else(
+    duration_qc %in% c("ok", "hours_ge24_days_zero"),
+    24 * days_raw + hours_raw,
+    NA_real_
+  )
+  tibble::tibble(
+    total_days = total_hours / 24,
+    total_hours = total_hours,
+    duration_qc = duration_qc
+  )
+}
+
+support_duration_qc <- list()
+for (support in c("vasopressors", "MV", "RRT", "ECMO")) {
+  days_col <- paste0(support, "_dur_days")
+  hours_col <- paste0(support, "_dur_hours")
+  days_raw_col <- paste0(days_col, "_raw")
+  hours_raw_col <- paste0(hours_col, "_raw")
+  # Источник — patients_extracted, а не финальный patients_tidy.
+  # Уже существующие raw не перезаписываем рассчитанными итогами.
+  if (!days_raw_col %in% names(patients_tidy)) {
+    if (!days_col %in% names(patients_tidy)) stop("Нет компонента длительности: ", days_col)
+    patients_tidy[[days_raw_col]] <- patients_tidy[[days_col]]
+  }
+  if (!hours_raw_col %in% names(patients_tidy)) {
+    if (!hours_col %in% names(patients_tidy)) stop("Нет компонента длительности: ", hours_col)
+    patients_tidy[[hours_raw_col]] <- patients_tidy[[hours_col]]
+  }
+  duration_result <- support_duration_total(
+    patients_tidy[[days_raw_col]], patients_tidy[[hours_raw_col]]
+  )
+  patients_tidy[[days_col]] <- duration_result$total_days
+  patients_tidy[[hours_col]] <- duration_result$total_hours
+  qc_col <- paste0(support, "_dur_qc")
+  patients_tidy[[qc_col]] <- duration_result$duration_qc
+  support_duration_qc[[support]] <- patients_tidy %>%
+    transmute(pat_record_id, support = support, duration_qc = .data[[qc_col]]) %>%
+    distinct() %>%
+    count(support, duration_qc, name = "n_patients")
+}
+support_duration_qc <- bind_rows(support_duration_qc)
+message("Длительность поддержки: полные часы и сутки рассчитаны из raw-компонентов.")
+print(support_duration_qc)
+
 # 4. Manual diagnosis/indication helper ----------------------------------
 
 manual_bin_to_int <- function(x) {
@@ -593,6 +657,71 @@ if (all(c("D_dimer", "D_dimer_unit") %in% names(patients_tidy))) {
     select(-starts_with(".dd_"))
 }
 
+# CLI: индекс капиллярной утечки для каждой исходной временной точки.
+# Формула: СРБ (мг/дл) / альбумин (г/л) * 100.
+# Конвертация только для расчёта CLI: исходные показатели не изменяем.
+# Неизвестные единицы/пропуски, СРБ < 0 и альбумин <= 0 дают NA.
+patients_tidy$CLI <- NA_real_
+if (all(c("C_react_protein", "C_react_protein_unit", "albumin", "albumin_unit") %in% names(patients_tidy))) {
+  patients_tidy <- patients_tidy %>%
+    mutate(
+      .cli_crp_unit = unit_norm(C_react_protein_unit),
+      .cli_alb_unit = unit_norm(albumin_unit),
+      .cli_crp_mgdl = case_when(
+        str_detect(.cli_crp_unit, "^(мг|mg)/(дл|dl)\\.?$") ~ C_react_protein,
+        str_detect(.cli_crp_unit, "^(мг|mg)/(л|l)\\.?$") ~ C_react_protein / 10,
+        TRUE ~ NA_real_
+      ),
+      .cli_albumin_gl = case_when(
+        str_detect(.cli_alb_unit, "^(г|g)/(л|l)\\.?$") ~ albumin,
+        str_detect(.cli_alb_unit, "^(г|g)/(дл|dl)\\.?$") ~ albumin * 10,
+        TRUE ~ NA_real_
+      ),
+      CLI = if_else(
+        is.finite(.cli_crp_mgdl) & .cli_crp_mgdl >= 0 &
+          is.finite(.cli_albumin_gl) & .cli_albumin_gl > 0,
+        .cli_crp_mgdl / .cli_albumin_gl * 100,
+        NA_real_
+      )
+    ) %>%
+    select(-starts_with(".cli_")) %>%
+    relocate(CLI, .after = C_react_protein_unit)
+}
+
+# HA_sorption_dose: скорость * длительность (часы, как в HA_duration) / BMI.
+# Это буквальная формула пользователя, без перевода часов в минуты (* 60).
+# BMI — признак уровня пациента; повторение по timepoint не размножает HA.
+# При противоречивых BMI расчёт останавливаем, не выбираем случайную строку.
+HA_tidy$HA_sorption_dose <- NA_real_
+if (all(c("pat_record_id", "BMI") %in% names(patients_tidy)) &&
+    all(c("pat_record_id", "HA_avg_blood_flow", "HA_duration") %in% names(HA_tidy))) {
+  bmi_by_id <- patients_tidy %>%
+    group_by(pat_record_id) %>%
+    summarise(
+      .bmi_n = n_distinct(BMI[!is.na(BMI)]),
+      .dose_bmi = first(BMI[!is.na(BMI)], default = NA_real_),
+      .groups = "drop"
+    )
+  if (any(bmi_by_id$.bmi_n > 1L)) {
+    stop("Разные BMI для одного pat_record_id: ",
+         paste(bmi_by_id$pat_record_id[bmi_by_id$.bmi_n > 1L], collapse = ", "))
+  }
+  HA_tidy <- HA_tidy %>%
+    left_join(select(bmi_by_id, pat_record_id, .dose_bmi),
+              by = "pat_record_id", na_matches = "never") %>%
+    mutate(
+      HA_sorption_dose = if_else(
+        is.finite(HA_avg_blood_flow) & HA_avg_blood_flow >= 0 &
+          is.finite(HA_duration) & HA_duration >= 0 &
+          is.finite(.dose_bmi) & .dose_bmi > 0,
+        HA_avg_blood_flow * HA_duration / .dose_bmi,
+        NA_real_
+      )
+    ) %>%
+    select(-.dose_bmi) %>%
+    relocate(HA_sorption_dose, .after = HA_duration)
+}
+
 # 12. HA -> patient-level features ----------------------------------------
 
 # Из таблицы процедур получаем признаки уровня пациента:
@@ -976,6 +1105,43 @@ if (all(c("VIS2020", "status", "vasopressors_if_used_bin") %in% names(patients_t
     dplyr::select(-.vis_baseline_positive)
 }
 
+# VDI (Vasopressor Dependency Index): VIS2020 / avg_BP для каждой timepoint.
+# avg_BP — среднее артериальное давление (MAP), мм рт. ст.
+# Вариант VIS / MAP использован, например, в EUPHAS2:
+# https://doi.org/10.1111/aor.13900
+# В реестре VIS2020 хранится готовым числом; ETL не рассчитывает его из доз.
+# До проверки формулы реестра результат следует описывать как VDI на основе
+# VIS2020: эквивалентность VDI конкретной публикации зависит от числителя.
+# VIS и MAP берём из одной строки (одной временной точки). Это не гарантирует
+# одновременность измерений; её нужно учитывать при интерпретации.
+# Используем VIS2020, а не VIS2020_0_excl: исходные нули не исключаем.
+# При известном VIS2020 = 0 и положительном MAP получаем VDI = 0.
+# Нули VIS, добавленные только по факту выписки (zero_after_ICU_discharge),
+# не считаем измеренными: для них VDI остаётся NA даже при наличии MAP.
+# Ноль при явно указанном отсутствии вазопрессоров допускается; его источник
+# можно отличить от наблюдаемого значения по VIS2020_fill_rule.
+# Пропуск, нечисловое/бесконечное значение, VIS < 0 или MAP <= 0 дают NA.
+# Долю доступных VDI оцениваем после запуска на актуальных данных (QC ниже).
+patients_tidy$VDI <- NA_real_
+if (all(c("VIS2020", "avg_BP") %in% names(patients_tidy))) {
+  .vdi_discharge_zero <- rep(FALSE, nrow(patients_tidy))
+  if ("VIS2020_fill_rule" %in% names(patients_tidy)) {
+    .vdi_discharge_zero <- patients_tidy$VIS2020_fill_rule %in%
+      "zero_after_ICU_discharge"
+  }
+  patients_tidy <- patients_tidy %>%
+    mutate(
+      VDI = if_else(
+        is.finite(VIS2020) & VIS2020 >= 0 &
+          is.finite(avg_BP) & avg_BP > 0 & !.vdi_discharge_zero,
+        VIS2020 / avg_BP,
+        NA_real_
+      )
+    ) %>%
+    relocate(VDI, .after = VIS2020)
+  rm(.vdi_discharge_zero)
+}
+
 # SIC score (Sepsis-Induced Coagulopathy), 0–6 баллов:
 # - тромбоциты: >=150 = 0; 100–<150 = 1; <100 = 2 (×10^9/л);
 # - INR: <=1.2 = 0; >1.2–<=1.4 = 1; >1.4 = 2;
@@ -1032,6 +1198,8 @@ if (all(c("thrombocytes", "INR", "SOFA") %in% names(patients_tidy))) {
 }
 
 # Единая колонка бактериальной флоры по грам-окраске + бинарные индикаторы по каждому посеву:
+patients_tidy$gram_any_bin <- NA_integer_
+patients_tidy$gram_score <- NA_integer_
 if (all(c("pat_gram_positive", "pat_gram_negative") %in% names(patients_tidy))) {
   patients_tidy <- patients_tidy %>%
     dplyr::mutate(
@@ -1041,9 +1209,25 @@ if (all(c("pat_gram_positive", "pat_gram_negative") %in% names(patients_tidy))) 
       ),
       is_pat_gram_minus = suppressWarnings(
         as.integer(as.character(culture_to_1_0_na(pat_gram_negative)))
+      ),
+      # Любой положительный результат достаточен для 1.
+      # 0 — оба отрицательные; неполное обследование без положительных — NA.
+      gram_any_bin = dplyr::case_when(
+        is_pat_gram_plus == 1L | is_pat_gram_minus == 1L ~ 1L,
+        is_pat_gram_plus == 0L & is_pat_gram_minus == 0L ~ 0L,
+        TRUE ~ NA_integer_
+      ),
+      # 0 означает только смешанную положительную флору.
+      # Для чистой категории нужны известные результаты обоих полей.
+      gram_score = dplyr::case_when(
+        is_pat_gram_plus == 1L & is_pat_gram_minus == 1L ~ 0L,
+        is_pat_gram_plus == 0L & is_pat_gram_minus == 1L ~ 1L,
+        is_pat_gram_plus == 1L & is_pat_gram_minus == 0L ~ -1L,
+        TRUE ~ NA_integer_
       )
     ) %>%
-    dplyr::relocate(pat_gram_stain, is_pat_gram_plus, is_pat_gram_minus, .after = pat_gram_negative)
+    dplyr::relocate(pat_gram_stain, is_pat_gram_plus, is_pat_gram_minus,
+                    gram_any_bin, gram_score, .after = pat_gram_negative)
 }
 
 if ("pat_bacteremia" %in% names(patients_tidy)) {
@@ -1277,7 +1461,11 @@ qc_missing_pat <- tibble::tibble(
     "SIC_positive",
     "PaFiO2",
     "SpFiO2",
-    "PaFiO2_calc"
+    "PaFiO2_calc",
+    "gram_any_bin",
+    "gram_score",
+    "CLI",
+    "VDI"
   ),
   n_missing = c(
     count_na_col(patients_tidy, "ICU_in_dt"),
@@ -1292,13 +1480,18 @@ qc_missing_pat <- tibble::tibble(
     count_na_col(patients_tidy, "SIC_positive"),
     count_na_col(patients_tidy, "PaFiO2"),
     count_na_col(patients_tidy, "SpFiO2"),
-    count_na_col(patients_tidy, "PaFiO2_calc")
+    count_na_col(patients_tidy, "PaFiO2_calc"),
+    count_na_col(patients_tidy, "gram_any_bin"),
+    count_na_col(patients_tidy, "gram_score"),
+    count_na_col(patients_tidy, "CLI"),
+    count_na_col(patients_tidy, "VDI")
   )
 )
 
 qc_missing_ha <- tibble::tibble(
-  variable = c("HA_start_dt"),
-  n_missing = c(count_na_col(HA_tidy, "HA_start_dt"))
+  variable = c("HA_start_dt", "HA_sorption_dose"),
+  n_missing = c(count_na_col(HA_tidy, "HA_start_dt"),
+                count_na_col(HA_tidy, "HA_sorption_dose"))
 )
 
 cat("\nMissingness in patients_tidy:\n")
@@ -1306,6 +1499,18 @@ print(qc_missing_pat)
 
 cat("\nMissingness in HA_tidy:\n")
 print(qc_missing_ha)
+
+# Доступность VDI по временным точкам (строки patients_tidy).
+vdi_coverage_qc <- patients_tidy %>%
+  group_by(timepoint) %>%
+  summarise(
+    n_rows = n(),
+    n_VDI = sum(!is.na(VDI)),
+    pct_VDI = 100 * n_VDI / n_rows,
+    .groups = "drop"
+  )
+cat("\nVDI coverage by timepoint:\n")
+print(vdi_coverage_qc)
 
 # 5) QC по PaFiO2_calc
 if ("PaFiO2_calc" %in% names(patients_tidy)) {

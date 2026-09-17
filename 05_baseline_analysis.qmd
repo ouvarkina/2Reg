@@ -10,20 +10,36 @@ execute:
   warning: false
   message: false
   cache: false
+editor: 
+  markdown: 
+    wrap: 72
 ---
 
 # Входные данные и предварительные условия
 
-Этот файл выполняет этап анализа исходных данных. В одном автономном QMD-файле объединены описательные таблицы, расчёты корреляций, частичные корреляции с поправкой на SOFA и таблицы подгрупп для T0.
+Этот файл выполняет этап анализа исходных данных. В одном автономном
+QMD-файле объединены описательные таблицы, расчёты корреляций, частичные
+корреляции с поправкой на SOFA и таблицы подгрупп для T0.
 
 Необходимые входные данные:
 
-data/patients_tidy.rds;
-data/HA_tidy.rds;
-data/analysis/baseline_severity_by_patient.rds, создаваемый скриптом 03b_severity_and_numeric_outcome.qmd;
-data/analysis/outcome_propensity_by_patient.rds, создаваемый скриптом 03b_severity_and_numeric_outcome.qmd.
+data/patients_tidy.rds; data/HA_tidy.rds;
+data/analysis/outcome_propensity_by_patient.rds, создаваемый скриптом
+03b_severity_and_numeric_outcome.qmd.
 
 Google-таблица Dictionary используется только для отображения подписей.
+Локальный `data/2Reg_Dictionary_tidy.xlsx` дополняет отсутствующие подписи
+(колонки `short`, `dataset`, `ru`, `kind`).
+
+В расширенной коррелограмме признаки `HA1_` относятся к записи
+«Гемоперфузия 1». Динамика: `da_` = после − до, `dr_` = после / до
+для пары `m12h_0h → 48h_72h`; при нулевом исходном значении `dr_ = NA`.
+
+Для расширенной корреляционной матрицы используется готовый
+`outcome_adj` из скрипта `03b` — остаток линейной регрессии
+`outcome_propensity ~ baseline_severity_index`. Положительное значение
+означает, что наблюдаемый исход лучше ожидаемого при данной исходной
+тяжести; отрицательное — хуже ожидаемого.
 
 # Setup
 
@@ -72,11 +88,6 @@ ha_rds <- pick_path(c(
   "HA_tidy.rds"
 ))
 
-severity_rds <- pick_path(c(
-  file.path(ANALYSIS_DATA_DIR, "baseline_severity_by_patient.rds"),
-  file.path("/mnt/data", ANALYSIS_DATA_DIR, "baseline_severity_by_patient.rds"),
-  "baseline_severity_by_patient.rds"
-))
 
 outcome_propensity_rds <- pick_path(c(
   file.path(ANALYSIS_DATA_DIR, "outcome_propensity_by_patient.rds"),
@@ -96,7 +107,8 @@ assert_columns(
     "ICU_6_month_history_bin", "RRT_required_baseline",
     "MV_required_baseline", "CT_count", "LPS_count", "devices_total",
     "is_pat_gram_plus", "is_pat_gram_minus", "is_bacteremic",
-    "is_pat_fungal", "antibiotics_started_bin"
+    "is_pat_fungal", "antibiotics_started_bin",
+    "gram_any_bin", "gram_score", "VDI"
   ),
   "patients_tidy"
 )
@@ -107,17 +119,19 @@ assert_columns(
     "HA_anticoagulation_cat", "HA_anticoag_heparin",
     "HA_cartridge_LPS_bin", "HA_with_RRT_bin",
     "HA_other_methods_bin", "HA_adverse_effects_bin",
-    "HA_adverse_effects_recorded_bin"
+    "HA_adverse_effects_recorded_bin", "HA_sorption_dose",
+    "HA_duration", "HA_avg_blood_flow", "HA_other_methods"
   ),
   "HA_tidy"
 )
 
-baseline_severity_by_patient <- readRDS(severity_rds) %>%
-  select(pat_record_id, baseline_severity_index, baseline_severity_coverage) %>%
-  distinct(pat_record_id, .keep_all = TRUE)
-
 outcome_propensity_by_patient <- readRDS(outcome_propensity_rds) %>%
-  select(pat_record_id, outcome_propensity) %>%
+  select(
+    pat_record_id,
+    baseline_severity_index,
+    outcome_propensity,
+    outcome_adj
+  ) %>%
   distinct(pat_record_id, .keep_all = TRUE)
 
 # Labels from the same Google Dictionary used in steps 03 and 04.
@@ -144,6 +158,25 @@ label_dictionary <- dictionary_raw %>%
   ) %>%
   filter(!is.na(short), short != "", !is.na(ru), ru != "") %>%
   distinct(short, .keep_all = TRUE)
+
+# Локальный tidy-словарь дополняет подписи, отсутствующие в Google Dictionary.
+# Настройки выбора переменных PCA остаются в Google Dictionary (скрипт 04).
+local_dictionary_candidates <- c(
+  file.path(DATA_DIR, "2Reg_Dictionary_tidy.xlsx"),
+  file.path("/mnt/data", DATA_DIR, "2Reg_Dictionary_tidy.xlsx"),
+  "2Reg_Dictionary_tidy.xlsx"
+)
+local_dictionary_path <- local_dictionary_candidates[file.exists(local_dictionary_candidates)]
+if (length(local_dictionary_path) > 0L) {
+  local_dictionary <- openxlsx::read.xlsx(local_dictionary_path[[1]], sheet = 1)
+  assert_columns(local_dictionary, c("short", "dataset", "ru", "kind"), "local dictionary")
+  label_dictionary <- bind_rows(
+    label_dictionary,
+    local_dictionary %>%
+      transmute(short = norm_txt(short), ru = norm_txt(ru)) %>%
+      filter(!is.na(short), short != "", !is.na(ru), ru != "")
+  ) %>% distinct(short, .keep_all = TRUE)
+}
 
 ru_map <- setNames(label_dictionary$ru, label_dictionary$short)
 dict_ha <- label_dictionary %>% select(short, ru)
@@ -526,21 +559,30 @@ saveRDS(
 ```{r}
 #| label: correlation-first-sorption
 
+# Отбираем именно именованную первую процедуру, а не любую раннюю запись.
+# Если таких записей несколько, сохраняем прежнее правило: самая ранняя дата.
 ha_first_corr <- HA_tidy %>%
   filter(HA_parameter == "Гемоперфузия 1") %>%
   arrange(pat_record_id, HA_start_dt) %>%
   group_by(pat_record_id) %>%
   slice_head(n = 1) %>%
   ungroup() %>%
+  mutate(.other_methods = str_to_lower(str_squish(as.character(HA_other_methods)))) %>%
   transmute(
     pat_record_id,
     HA1_start_datetime = HA_start_dt,
-    HA_duration,
-    HA_avg_blood_flow,
-    first_sorption_LPS = HA_cartridge_LPS_bin,
-    HA_anticoag_heparin,
-    HA_other_methods_bin,
-    HA_adverse_effects_bin
+    HA1_duration = HA_duration,
+    HA1_sorption_dose = HA_sorption_dose,
+    HA1_avg_blood_flow = HA_avg_blood_flow,
+    HA1_cartridge_LPS_bin = HA_cartridge_LPS_bin,
+    HA1_anticoag_heparin = HA_anticoag_heparin,
+    # Пропуск не означает комбинированную сорбцию.
+    HA1_other_methods_bin = case_when(
+      is.na(.other_methods) | .other_methods %in% c("", "na", "n/a") ~ NA_integer_,
+      .other_methods == "не применялась" ~ 0L,
+      TRUE ~ 1L
+    ),
+    HA1_adverse_effects_bin = HA_adverse_effects_bin
   )
 ```
 
@@ -555,15 +597,15 @@ corr_t0 <- patients_tidy %>%
   distinct(pat_record_id, .keep_all = TRUE) %>%
   left_join(ha_first_corr, by = "pat_record_id") %>%
   left_join(
-    baseline_severity_by_patient %>%
-      select(pat_record_id, baseline_severity_index),
-    by = "pat_record_id"
-  ) %>%
-  left_join(
-    outcome_propensity_by_patient %>%
-      select(pat_record_id, outcome_propensity),
-    by = "pat_record_id"
-  ) %>%
+  outcome_propensity_by_patient %>%
+    select(
+      pat_record_id,
+      baseline_severity_index,
+      outcome_propensity,
+      outcome_adj
+    ),
+  by = "pat_record_id"
+) %>%
   mutate(
     is_septic_bin = bin_from_any(is_septic),
     is_lps_72h = bin_from_any(is_lps_72h),
@@ -578,7 +620,62 @@ corr_t0 <- patients_tidy %>%
 
 ```
 
-## Dynamics 0–48 h
+# Временный диагностический блок
+
+```{r}
+
+comparison_df <- corr_t0 %>%
+  select(
+    pat_record_id,
+    SOFA,
+    baseline_severity_index,
+    outcome_propensity
+  ) %>%
+  filter(
+    !is.na(SOFA),
+    !is.na(baseline_severity_index),
+    !is.na(outcome_propensity)
+  )
+
+m_severity <- lm(
+  outcome_propensity ~ baseline_severity_index,
+  data = comparison_df
+)
+
+m_sofa <- lm(
+  outcome_propensity ~ SOFA,
+  data = comparison_df
+)
+
+comparison_results <- tibble(
+  predictor = c("Baseline severity index", "SOFA"),
+  n = nrow(comparison_df),
+  R2 = c(
+    summary(m_severity)$r.squared,
+    summary(m_sofa)$r.squared
+  ),
+  RMSE = c(
+    sqrt(mean(residuals(m_severity)^2)),
+    sqrt(mean(residuals(m_sofa)^2))
+  ),
+  Spearman_rho = c(
+    cor(
+      comparison_df$baseline_severity_index,
+      comparison_df$outcome_propensity,
+      method = "spearman"
+    ),
+    cor(
+      comparison_df$SOFA,
+      comparison_df$outcome_propensity,
+      method = "spearman"
+    )
+  )
+)
+
+comparison_results
+```
+
+## Динамика m12h_0h → 48h_72h
 
 ```{r}
 #| label: correlation-dynamics
@@ -592,7 +689,9 @@ dyn_vars <- intersect(
   names(patients_tidy)
 )
 
-patients_dyn_delta <- patients_tidy %>%
+# VIS сохраняет прежний принцип: динамика VIS2020_0_excl у пациентов
+# с положительным VIS на исходной точке. Пропуски не заполняем.
+patients_dyn_long <- patients_tidy %>%
   filter(timepoint %in% c(timepoint_t0, timepoint_t1)) %>%
   select(pat_record_id, timepoint, all_of(dyn_vars)) %>%
   pivot_longer(
@@ -602,11 +701,27 @@ patients_dyn_delta <- patients_tidy %>%
   ) %>%
   group_by(pat_record_id, variable, timepoint) %>%
   summarise(value = first_non_na(value), .groups = "drop") %>%
-  pivot_wider(names_from = timepoint, values_from = value) %>%
-  filter(all(c(timepoint_t0, timepoint_t1) %in% names(.))) %>%
-  mutate(delta = .data[[timepoint_t1]] - .data[[timepoint_t0]]) %>%
-  select(pat_record_id, variable, delta) %>%
+  pivot_wider(names_from = timepoint, values_from = value)
+
+# Отсутствие целой временной точки также означает NA, а не ошибку обращения.
+for (tp in c(timepoint_t0, timepoint_t1)) {
+  if (!tp %in% names(patients_dyn_long)) {
+    patients_dyn_long[[tp]] <- rep(NA_real_, nrow(patients_dyn_long))
+  }
+}
+
+patients_dyn_delta <- patients_dyn_long %>%
   mutate(
+    da = if_else(
+      is.finite(.data[[timepoint_t0]]) & is.finite(.data[[timepoint_t1]]),
+      .data[[timepoint_t1]] - .data[[timepoint_t0]], NA_real_
+    ),
+    # Отношение после/до, не процент и не (после-до)/до.
+    dr = if_else(
+      is.finite(.data[[timepoint_t0]]) & is.finite(.data[[timepoint_t1]]) &
+        .data[[timepoint_t0]] != 0,
+      .data[[timepoint_t1]] / .data[[timepoint_t0]], NA_real_
+    ),
     variable = recode(
       variable,
       "VIS2020_0_excl" = "VIS2020",
@@ -616,10 +731,10 @@ patients_dyn_delta <- patients_tidy %>%
       "creatinine" = "Crea",
       "C_react_protein" = "CRP",
       "bilirubin_total" = "bilirubin"
-    ),
-    variable = paste0("delta_", variable)
+    )
   ) %>%
-  pivot_wider(names_from = variable, values_from = delta)
+  select(pat_record_id, variable, da, dr) %>%
+  pivot_wider(names_from = variable, values_from = c(da, dr), names_glue = "{.value}_{variable}")
 
 corr_full <- corr_t0 %>%
   left_join(patients_dyn_delta, by = "pat_record_id")
@@ -663,15 +778,15 @@ corr_full <- corr_full %>%
       any_of(c(
         diag_vars, ind_vars, culture_vars,
         "ICU_6_month_history_bin", "is_septic_bin", "ECMO_if_used_bin",
-        "is_lps_72h", "first_sorption_LPS", "SIC_positive"
+        "is_lps_72h", "HA1_cartridge_LPS_bin", "SIC_positive", "gram_any_bin"
       )),
       bin_from_any
     )
   )
 
 corr_vars <- c(
-  "age_yr", "sex_male_bin", "BMI", "charlson_index", "ICU_6_month_history_bin",
-  "baseline_severity_index", "SOFA", "VIS2020_0_excl", "INR", "SIC_score", "SIC_positive",
+  "age_yr", "sex_male_bin", "BMI", "charlson_index", "ICU_6_month_history_bin", "baseline_severity_index",
+  "outcome_adj", "SOFA", "VIS2020_0_excl", "VDI", "gram_any_bin", "gram_score", "INR", "SIC_score", "SIC_positive",
   "PaFiO2_calc", "PaFiO2", "SpFiO2", "avg_BP",
   "vasopressors_if_used_bin", "RRT_if_used_bin", "MV_if_used_bin",
   "ECMO_if_used_bin", "from_other_ICU_transfer_bin", "is_septic_bin",
@@ -680,11 +795,11 @@ corr_vars <- c(
   "lactate", "creatinine", "albumin", "C_react_protein", "procalcitonin",
   "D_dimer", "fibrinogen", "leucocytes", "lymphocytes", "neutrophils", "NLR",
   "thrombocytes", "bilirubin_total", "icu_to_HA1_hours", "antibiotics_to_HA1_hours",
-  "HA_duration", "HA_avg_blood_flow", "first_sorption_LPS", "is_lps_72h",
-  "HA_anticoag_heparin", "HA_other_methods_bin", "HA_adverse_effects_bin",
-  "HA_efficency_CGI_E", "delta_SOFA", "delta_VIS2020", "delta_PLT",
-  "delta_LYM", "delta_NEU", "delta_NLR", "delta_Crea", "delta_CRP",
-  "delta_bilirubin", "outcome_days", "outcome_dead_bin", "outcome_propensity"
+  "HA1_duration", "HA1_sorption_dose", "HA1_avg_blood_flow", "HA1_cartridge_LPS_bin", "is_lps_72h",
+  "HA1_anticoag_heparin", "HA1_other_methods_bin", "HA1_adverse_effects_bin",
+  "HA_efficency_CGI_E",
+  names(patients_dyn_delta)[str_detect(names(patients_dyn_delta), "^(da|dr)_")],
+  "outcome_days", "outcome_dead_bin", "outcome_propensity"
 )
 
 corr_numeric <- corr_full %>%
@@ -753,7 +868,8 @@ ind_label_map <- ind_label_map[names(ind_label_map) %in% ind_vars]
 
 corr_label_map <- c(
   age_yr = "Age", sex_male_bin = "Male", BMI = "BMI", charlson_index = "Charlson",
-  ICU_6_month_history_bin = "ICU_6m", baseline_severity_index = "severity_index", SOFA = "SOFA", VIS2020_0_excl = "VIS",
+  ICU_6_month_history_bin = "ICU_6m", baseline_severity_index = "severity_index", outcome_adj = "outcome_adj", SOFA = "SOFA", VIS2020_0_excl = "VIS",
+  VDI = "VDI", gram_any_bin = "gram_any_bin", gram_score = "gram_score",
   INR = "INR", SIC_score = "SIC_score", SIC_positive = "SIC_positive",
   PaFiO2_calc = "PF_ratio", PaFiO2 = "PaFiO2", SpFiO2 = "SpFiO2", avg_BP = "avg_BP",
   vasopressors_if_used_bin = "Vaso", RRT_if_used_bin = "RRT", MV_if_used_bin = "MV",
@@ -767,15 +883,18 @@ corr_label_map <- c(
   D_dimer = "D_dimer", fibrinogen = "fibrinogen", leucocytes = "WBC",
   lymphocytes = "LYM", neutrophils = "NEU", NLR = "NLR", thrombocytes = "PLT",
   bilirubin_total = "bilirubin", icu_to_HA1_hours = "ICU_to_HA_h",
-  antibiotics_to_HA1_hours = "AB_to_HA_h", HA_duration = "HA_duration",
-  HA_avg_blood_flow = "blood_flow", first_sorption_LPS = "first_LPS", is_lps_72h = "LPS_72h",
-  HA_anticoag_heparin = "Heparin", HA_other_methods_bin = "other_ECM",
-  HA_adverse_effects_bin = "AE_HA", HA_efficency_CGI_E = "CGI_E",
-  delta_SOFA = "dSOFA", delta_VIS2020 = "dVIS", delta_PLT = "dPLT", delta_LYM = "dLYM",
-  delta_NEU = "dNEU", delta_NLR = "dNLR", delta_Crea = "dCrea", delta_CRP = "dCRP",
-  delta_bilirubin = "dBili", outcome_days = "outcome_days", outcome_dead_bin = "death",
+  antibiotics_to_HA1_hours = "AB_to_HA_h", HA1_duration = "HA1_duration",
+  HA1_sorption_dose = "HA1_sorption_dose", HA1_avg_blood_flow = "HA1_avg_blood_flow",
+  HA1_cartridge_LPS_bin = "HA1_cartridge_LPS_bin", is_lps_72h = "LPS_72h",
+  HA1_anticoag_heparin = "HA1_anticoag_heparin", HA1_other_methods_bin = "HA1_other_methods_bin",
+  HA1_adverse_effects_bin = "HA1_adverse_effects_bin", HA_efficency_CGI_E = "CGI_E",
+  outcome_days = "outcome_days", outcome_dead_bin = "death",
   outcome_propensity = "outcome_score", diag_label_map, ind_label_map
 )
+
+# На осях сохраняем явные префиксы da_ и dr_.
+delta_names <- names(patients_dyn_delta)[str_detect(names(patients_dyn_delta), "^(da|dr)_")]
+corr_label_map <- c(corr_label_map, setNames(delta_names, delta_names))
 
 corr_numeric_plot <- corr_numeric
 new_names <- names(corr_numeric_plot)
@@ -802,18 +921,19 @@ cat("Correlation input saved:", nrow(corr_numeric_plot), "rows x", ncol(corr_num
 #| label: kendall-baseline
 
 vars_corr <- c(
-  "age_yr", "BMI", "SOFA", "icu_to_HA1_hours", "VIS2020", "PaFiO2_calc",
+  "age_yr", "BMI", "SOFA", "icu_to_HA1_hours", "VIS2020", "VDI",
+  "gram_any_bin", "gram_score", "HA1_duration", "HA1_sorption_dose",
+  "HA1_avg_blood_flow", "HA1_other_methods_bin", "PaFiO2_calc",
   "lactate", "creatinine", "albumin", "C_react_protein", "procalcitonin",
   "D_dimer", "fibrinogen", "leucocytes", "lymphocytes", "neutrophils",
   "NLR", "thrombocytes"
 )
 
-pt_corr <- patients_tidy %>%
-  filter(timepoint == "m12h_0h") %>%
+pt_corr <- corr_t0 %>%
   distinct(pat_record_id, .keep_all = TRUE) %>%
   select(any_of(vars_corr)) %>%
   mutate(across(everything(), ~ suppressWarnings(as.numeric(.x)))) %>%
-  select(where(~ sum(!is.na(.x)) >= 2))
+  select(where(~ sum(!is.na(.x)) >= 2 && n_distinct(.x, na.rm = TRUE) > 1))
 
 if (ncol(pt_corr) >= 2) {
   cor_mat_kendall <- cor(
@@ -887,12 +1007,13 @@ order_block_hclust <- function(vars, M) {
 block_vars <- list(
   demo = c("Age", "Male", "BMI", "Charlson", "ICU_6m"),
   clinical = c(
-    "severity_index", "SOFA", "VIS", "INR", "SIC_score", "SIC_positive", "PF_ratio",
+    "severity_index",
+    "SOFA", "VIS", "VDI", "INR", "SIC_score", "SIC_positive", "PF_ratio",
     "PaFiO2", "SpFiO2", "avg_BP", "Vaso", "RRT", "MV", "ECMO",
     "Transfer", "septic", "Vaso_dur_h", "RRT_dur_h", "MV_dur_h",
     "ECMO_dur_h", "ICU_to_AB_h"
   ),
-  cultures = c("cult_Gram_plus", "cult_Gram_minus", "cult_bacteremia", "cult_fungal"),
+  cultures = c("gram_any_bin", "gram_score", "cult_Gram_plus", "cult_Gram_minus", "cult_bacteremia", "cult_fungal"),
   diagnoses = unname(diag_label_map),
   indications = unname(ind_label_map),
   labs = c(
@@ -900,11 +1021,12 @@ block_vars <- list(
     "fibrinogen", "WBC", "LYM", "NEU", "NLR", "PLT", "bilirubin"
   ),
   sorption = c(
-    "ICU_to_HA_h", "AB_to_HA_h", "HA_duration", "blood_flow", "first_LPS",
-    "LPS_72h", "Heparin", "other_ECM", "AE_HA", "CGI_E"
+    "ICU_to_HA_h", "AB_to_HA_h", "HA1_duration", "HA1_sorption_dose",
+    "HA1_avg_blood_flow", "HA1_cartridge_LPS_bin", "LPS_72h",
+    "HA1_anticoag_heparin", "HA1_other_methods_bin", "HA1_adverse_effects_bin", "CGI_E"
   ),
-  dynamics = c("dSOFA", "dVIS", "dPLT", "dLYM", "dNEU", "dNLR", "dCrea", "dCRP", "dBili"),
-  outcomes = c("outcome_days", "death", "outcome_score")
+  dynamics = delta_names,
+  outcomes = c("outcome_days", "death", "outcome_score", "outcome_adj")
 )
 
 block_order <- block_vars %>%
@@ -1415,7 +1537,7 @@ tbl_baseline_anticoag <- pt_anticoag_t0 %>%
 tbl_baseline_anticoag
 ```
 
-## T0: INR <1.4 vs ≥1.4
+## T0: INR \<1.4 vs ≥1.4
 
 ```{r}
 #| label: t0-inr
