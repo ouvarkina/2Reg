@@ -2,10 +2,15 @@
 data/*.json
 data/*.rds
 data/*.xlsx
+data/intermediate/
+data/analysis/
 *.xlsx
 !data/2Reg_Dictionary_tidy.xlsx
 !data/2Reg_patients_indications.xlsx
 !data/2Reg_diagnoses.xlsx
+
+# raw source drops (patient data, not for git)
+inbox/
 
 # generated outputs
 tables/*
@@ -23,3 +28,6 @@ graphes/*
 .quarto/
 *_cache/
 *.html
+
+# local-only files
+AGENT_R_WORKFLOW.md

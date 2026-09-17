@@ -1,0 +1,226 @@
+---
+title: "2Reg — new_severity_score (equal-weight SOFA-based scale)"
+format:
+  html:
+    toc: true
+    number-sections: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+# Входные данные и предварительные условия
+
+Необходимые входные данные ETL:
+
+data/patients_tidy.rds
+
+В отличие от `baseline_severity_index` (см. 03b), эта шкала не использует
+Google-таблицу Dictionary — набор компонентов, их веса и нормировка заданы
+прямо в этом файле, поэтому расчёт полностью детерминирован и не требует
+доступа в интернет.
+
+Файл не изменяет и не перезаписывает patients_tidy.rds.
+
+# Идея шкалы
+
+Простая равновзвешенная сумма клинически осмысленных компонентов
+(в духе APACHE / других "ручных" шкал тяжести), а не статистически
+подобранные веса:
+
+| Компонент | Диапазон | Источник |
+|---|---|---|
+| SOFA без сердечно-сосудистой субшкалы (SOFA_noCV) | 0-20 | patients_tidy (см. 01b) |
+| NLR (нейтрофильно-лимфоцитарное отношение) | 0-2 | процентильный ранг в когорте |
+| VIS2020 | 0-4 | процентильный ранг в когорте |
+| C-реактивный белок | 0-2 | процентильный ранг в когорте |
+| Индекс Чарлсон | 0-4 | процентильный ранг в когорте |
+| Бактериемия (по посеву) | 0/1 | patients_tidy: is_bacteremic |
+| Пребывание в ОРИТ за последние 6 мес. | 0/1 | patients_tidy: ICU_6_month_history_bin |
+
+Номинальный максимум шкалы: 20+2+4+2+4+1+1 = **34**.
+
+Компоненты NLR/VIS2020/CRP/Charlson нормируются процентильным рангом
+(худший в когорте -> целевой максимум, лучший -> 0), а не min-max:
+в данных есть экстремальные выбросы (например, один пациент с VIS2020=2500
+при 99-м перцентиле 155, похоже на ошибку ввода дозы вазопрессина) —
+min-max в этом случае сжал бы шкалу для 99% остальных пациентов почти в
+точку. Процентильный ранг устойчив к таким выбросам.
+
+Пропущенные компоненты не штрафуют пациента: сумма делится на доступный
+для этого пациента максимум и домасштабируется до полного номинального (34).
+
+# Setup
+
+```{r}
+#| label: setup
+#| include: false
+#| cache: false
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(openxlsx)
+})
+
+source("R/analysis_helpers.R")
+
+DATA_DIR <- "data"
+ANALYSIS_DATA_DIR <- file.path(DATA_DIR, "analysis")
+TABLES_DIR <- "tables"
+
+dir.create(ANALYSIS_DATA_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(TABLES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+patients_rds <- pick_path(c(
+  file.path(DATA_DIR, "patients_tidy.rds"),
+  file.path("/mnt/data", DATA_DIR, "patients_tidy.rds"),
+  "patients_tidy.rds"
+))
+
+patients_tidy <- readRDS(patients_rds)
+
+baseline_timepoint_for_score <- "m12h_0h"
+```
+
+# Baseline-таблица
+
+```{r}
+#| label: baseline-table
+
+required_cols <- c(
+  "pat_record_id", "timepoint", "SOFA_noCV", "NLR", "VIS2020",
+  "C_react_protein", "charlson_index", "is_bacteremic",
+  "ICU_6_month_history_bin"
+)
+missing_cols <- setdiff(required_cols, names(patients_tidy))
+if (length(missing_cols) > 0) {
+  stop(
+    "Для расчёта new_severity_score в patients_tidy нет колонок: ",
+    paste(missing_cols, collapse = ", ")
+  )
+}
+
+baseline <- patients_tidy %>%
+  dplyr::filter(timepoint == baseline_timepoint_for_score) %>%
+  dplyr::arrange(pat_record_id) %>%
+  dplyr::distinct(pat_record_id, .keep_all = TRUE)
+
+cat("n patients at baseline:", nrow(baseline), "\n")
+```
+
+# Процентильный ранг NLR/VIS2020/CRP/Charlson
+
+```{r}
+#| label: percentile-normalization
+
+# Ранг 0..target_max: худшее в когорте значение -> target_max, лучшее -> 0.
+# Устойчиво к выбросам (в отличие от min-max), совпадающие значения получают
+# одинаковый (средний) ранг.
+percentile_rank_to <- function(x, target_max) {
+  n_obs <- sum(!is.na(x))
+  if (n_obs <= 1) {
+    return(rep(NA_real_, length(x)))
+  }
+  pctl <- (rank(x, ties.method = "average", na.last = "keep") - 1) / (n_obs - 1)
+  pctl * target_max
+}
+
+baseline <- baseline %>%
+  dplyr::mutate(
+    NLR_norm      = percentile_rank_to(NLR, 2),
+    VIS_norm      = percentile_rank_to(VIS2020, 4),
+    CRP_norm      = percentile_rank_to(C_react_protein, 2),
+    Charlson_norm = percentile_rank_to(charlson_index, 4)
+  )
+
+cat("Диапазоны исходных значений (для справки, выбросы не обрезаются):\n")
+cat("NLR:", paste(round(range(baseline$NLR, na.rm = TRUE), 2), collapse = " - "), "\n")
+cat("VIS2020:", paste(round(range(baseline$VIS2020, na.rm = TRUE), 2), collapse = " - "), "\n")
+cat("CRP:", paste(round(range(baseline$C_react_protein, na.rm = TRUE), 2), collapse = " - "), "\n")
+cat("Charlson:", paste(round(range(baseline$charlson_index, na.rm = TRUE), 2), collapse = " - "), "\n")
+```
+
+# Сборка итоговой шкалы
+
+```{r}
+#| label: assemble-score
+
+component_max <- c(
+  SOFA_noCV = 20, NLR_norm = 2, VIS_norm = 4, CRP_norm = 2,
+  Charlson_norm = 4, is_bacteremic = 1, ICU_6_month_history_bin = 1
+)
+total_max <- sum(component_max)
+
+component_mat <- baseline %>%
+  dplyr::select(
+    SOFA_noCV, NLR_norm, VIS_norm, CRP_norm, Charlson_norm,
+    is_bacteremic, ICU_6_month_history_bin
+  ) %>%
+  as.matrix()
+
+available_mat <- !is.na(component_mat)
+component_mat[is.na(component_mat)] <- 0
+available_max_mat <- sweep(available_mat, 2, component_max, `*`)
+
+baseline <- baseline %>%
+  dplyr::mutate(
+    .score_raw_points = rowSums(component_mat),
+    .available_max = rowSums(available_max_mat),
+    new_severity_score_coverage = .available_max / total_max,
+    new_severity_score = dplyr::if_else(
+      .available_max > 0,
+      .score_raw_points / .available_max * total_max,
+      NA_real_
+    )
+  ) %>%
+  dplyr::select(-.score_raw_points, -.available_max)
+
+cat("new_severity_score summary (номинальный диапазон 0-", total_max, "):\n", sep = "")
+print(summary(baseline$new_severity_score))
+cat("\ncoverage summary:\n")
+print(summary(baseline$new_severity_score_coverage))
+cat(
+  "n c полным покрытием (все 7 компонентов):",
+  sum(round(baseline$new_severity_score_coverage, 3) >= 0.999),
+  "of", nrow(baseline), "\n"
+)
+```
+
+# Сохранение
+
+```{r}
+#| label: save-outputs
+
+new_severity_score_out <- baseline %>%
+  dplyr::select(
+    pat_record_id,
+    SOFA, cv_sofa, SOFA_noCV,
+    NLR, NLR_norm,
+    VIS2020, VIS_norm,
+    C_react_protein, CRP_norm,
+    charlson_index, Charlson_norm,
+    is_bacteremic,
+    ICU_6_month_history_bin,
+    new_severity_score,
+    new_severity_score_coverage
+  )
+
+saveRDS(
+  new_severity_score_out,
+  file.path(ANALYSIS_DATA_DIR, "new_severity_score.rds")
+)
+
+openxlsx::write.xlsx(
+  new_severity_score_out,
+  file.path(TABLES_DIR, "2Reg_new_severity_score.xlsx"),
+  asTable = TRUE,
+  overwrite = TRUE
+)
+
+cat("Saved:\n")
+cat(" -", file.path(ANALYSIS_DATA_DIR, "new_severity_score.rds"), "\n")
+cat(" -", file.path(TABLES_DIR, "2Reg_new_severity_score.xlsx"), "\n")
+```
