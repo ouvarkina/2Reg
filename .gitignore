@@ -4,6 +4,8 @@ data/*.rds
 data/*.xlsx
 *.xlsx
 !data/2Reg_Dictionary_tidy.xlsx
+!data/2Reg_patients_indications.xlsx
+!data/2Reg_diagnoses.xlsx
 
 # generated outputs
 tables/*
